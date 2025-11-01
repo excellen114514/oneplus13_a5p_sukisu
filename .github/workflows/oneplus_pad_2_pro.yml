@@ -7,9 +7,14 @@ on:
         required: true
         default: true
         type: boolean
+      enable_feature_y:
+        description: "跳过版本比较"
+        required: false
+        default: false
+        type: boolean
   
-  schedule:
-    - cron: '0 22 * * *'
+  #schedule:
+    #- cron: '0 22 * * *'
       
 jobs:
   build:
@@ -39,9 +44,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y python3 git curl
-          sudo apt install -y python3 git curl ccache
-          sudo apt install -y zip
+          sudo apt install -y python3 git curl ccache zip
 
       - name: Restore ccache
         uses: actions/cache@v3
@@ -52,7 +55,7 @@ jobs:
             ccache-${{ runner.os }}-
 
       - name: Compare Version
-        if: ${{!inputs.enable_feature_x}}
+        if: ${{!inputs.enable_feature_y}}
         run: |
           git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra.git SUKI/
           cd SUKI
@@ -60,7 +63,13 @@ jobs:
           KSU_VERSION=$((10000 + KSU_GIT_VERSION + 700))
           LATEST_TAG=$(git ls-remote --tags https://github.com/44C38B8/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
           if [ $LATEST_TAG -eq $KSU_VERSION ];then exit 1;fi
-          cd ..
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            pad2pro_fix.patch
+          sparse-checkout-cone-mode: false
 
       - name: Install repo tool
         run: |
@@ -92,13 +101,15 @@ jobs:
              }
              { print }
          ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
-
       
         
       - name: Set up susfs
         run: |
            cd kernel_workspace
            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6
+           cd susfs4ksu/kernel_patches/
+           patch < $GITHUB_WORKSPACE/pad2pro_fix.patch
+           cd ../..
            git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
 
            cd kernel_platform        
