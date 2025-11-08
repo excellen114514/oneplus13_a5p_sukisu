@@ -7,6 +7,11 @@ on:
         required: false
         default: false
         type: boolean
+      enable_feature_y:
+        description: "跳过版本比较"
+        required: false
+        default: false
+        type: boolean
   
   schedule:
     - cron: '0 22 * * *'
@@ -44,7 +49,7 @@ jobs:
           sudo apt install -y zip
 
       - name: Compare Version
-        if: ${{!inputs.enable_feature_x}}
+        if: ${{!inputs.enable_feature_y}}
         run: |
           git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra.git SUKI/
           cd SUKI
@@ -71,7 +76,7 @@ jobs:
       - name: Initialize repo and sync
         run: |
          mkdir kernel_workspace && cd kernel_workspace
-         repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/sm8750 -m oneplus_13t.xml --depth=1
+         repo init -u https://github.com/44C38B8/kernel_manifest.git -b refs/heads/oneplus/sm8750 -m oneplus_13t.xml --depth=1
          repo --trace sync -c -j$(nproc --all) --no-tags
          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
@@ -80,13 +85,19 @@ jobs:
         run: |
          echo DATE=$(date +%F) >> $GITHUB_ENV
          cd kernel_workspace/kernel_platform
-         curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-test
+         curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
          cd ./KernelSU
          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10700)
          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
          export KSU_VERSION=$KSU_VERSION
          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile 
          awk -v old='v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --abbrev-ref HEAD)' -v new='v$1-$(KSU_VERSION)-酷安@骁龙8至尊版' '
+             index($0, old) {
+                 $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
+             }
+             { print }
+         ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
+         awk -v old='KSU_VERSION := $(shell expr 40000 + $(KSU_GITHUB_VERSION_COMMIT) - 2815)' -v new='KSU_VERSION := $(shell expr 10000 + $(KSU_GITHUB_VERSION_COMMIT) + 700)' '
              index($0, old) {
                  $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
              }
@@ -112,8 +123,8 @@ jobs:
            cd ./common
 
            patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch || true
-           cp ../../SukiSU_patch/hooks/syscall_hooks.patch ./
-           patch -p1 -F 3 < syscall_hooks.patch
+           cp ../../SukiSU_patch/hooks/scope_min_manual_hooks_v1.6.patch ./
+           patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch
            echo "完成"
       
       - name: Apply HMBird GKI patch
