@@ -30,7 +30,7 @@ jobs:
           git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
           cd SukiSU-Ultra
           KSU_GIT_VERSION=$(git rev-list --count HEAD)
-          KSU_VERSION=$((10000 + KSU_GIT_VERSION + 700))
+          KSU_VERSION=$((37185 + KSU_GIT_VERSION))
           echo $KSU_VERSION
           echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
           
@@ -53,7 +53,7 @@ jobs:
           # 获取 Manager 文件的下载链接
           
           
-          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name == "manager") | .archive_download_url')
+          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name == "Manager") | .archive_download_url')
           echo $DOWNLOAD_URL
 
           # 下载 Manager 文件
