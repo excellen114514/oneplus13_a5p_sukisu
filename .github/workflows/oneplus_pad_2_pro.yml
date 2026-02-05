@@ -38,8 +38,8 @@ jobs:
           
       - name: Configure Git
         run: |
-         git config --global user.name "excellen114514"
-         git config --global user.email "xiuxianing@foxmail.com"
+         git config --global user.name "44C38B8"
+         git config --global user.email "b2762537725@163.com"
 
       - name: Install dependencies
         run: |
@@ -94,7 +94,7 @@ jobs:
          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
          export KSU_VERSION=$KSU_VERSION
          # sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
-         awk -v old='v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --abbrev-ref HEAD)' -v new='v$1-$(KSU_VERSION)-Elaina@ExceSama' '
+         awk -v old='v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --abbrev-ref HEAD)' -v new='v$1-$(KSU_VERSION)-酷安@骁龙8至尊版' '
              index($0, old) {
                  $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
              }
@@ -275,7 +275,7 @@ jobs:
           git add -A && git commit -a -m "BUILD Kernel"
       
       - name: Add KPM Configuration Settings
-        if: ${{(github.event_name == 'schedule') || (inputs.enable_feature_x == true) && steps.check.outputs.should_cancel != 'yes'}} 
+        if: ${{inputs.enable_feature_x && steps.check.outputs.should_cancel != 'yes'}}
         run: |
           cd kernel_workspace/kernel_platform
           echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -283,7 +283,7 @@ jobs:
           #Remove check_defconfig
           sudo sed -i 's/check_defconfig//' ./common/build.config.gki
           cd common
-          git add -A && git commit -a -m "BUILD Kernel with KPM"
+          git add -A && git commit -a -m "BUILD Kernel"
           
       - name: Add make name
         if: steps.check.outputs.should_cancel != 'yes'
@@ -309,6 +309,7 @@ jobs:
           export PATH="/usr/lib/ccache:$PATH"
           sudo apt install libelf-dev
           cd kernel_workspace/kernel_platform/common
+          sed "661,662d" ../drivers/kernelsu/supercalls.c
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole LD=ld.lld  HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS_PERF+=-O3 gki_defconfig all
           
       - name: Apply Linux Patch
