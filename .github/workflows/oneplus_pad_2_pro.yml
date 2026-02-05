@@ -61,7 +61,7 @@ jobs:
           git clone https://github.com/ReSukiSU/ReSukiSU.git SUKI/
           cd SUKI
           KSU_GIT_VERSION=$(git rev-list --count HEAD)
-          KSU_VERSION=$((37185 + KSU_GIT_VERSION))
+          KSU_VERSION=$((30778 + KSU_GIT_VERSION))
           LATEST_TAG=$(git ls-remote --tags https://github.com/excellen114514/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
           if [ $LATEST_TAG -eq $KSU_VERSION ];then
             echo "should_cancel=yes" >> $GITHUB_OUTPUT
@@ -90,7 +90,7 @@ jobs:
          cd kernel_workspace/kernel_platform
          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s builtin
          cd ./KernelSU
-         KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 37185)
+         KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 30778)
          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
          export KSU_VERSION=$KSU_VERSION
          # sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
@@ -316,7 +316,7 @@ jobs:
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
          cd kernel_workspace/kernel_platform/common/out/arch/arm64/boot
-         curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+         curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
          chmod +x patch_linux
          ./patch_linux
          rm -f Image
