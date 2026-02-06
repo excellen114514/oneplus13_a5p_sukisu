@@ -56,7 +56,7 @@ jobs:
 
       - name: Compare Version
         id: check
-        if: ${{!inputs.enable_feature_y}}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.enable_feature_y || github.event_name == 'schedule' }}
         run: |
           git clone https://github.com/ReSukiSU/ReSukiSU.git SUKI/
           cd SUKI
@@ -93,21 +93,16 @@ jobs:
          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 30778)
          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
          export KSU_VERSION=$KSU_VERSION
-         # sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
-         awk -v old='v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --abbrev-ref HEAD)' -v new='v$1-$(KSU_VERSION)-Elaina@ExceSama' '
-             index($0, old) {
-                 $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
-             }
-             { print }
-         ' kernel/Kbuild > kernel/Kbuild.tmp && mv kernel/Kbuild.tmp kernel/Kbuild
+         # 使用sed直接替换Kbuild中的版本定义字符串
+         sed -i 's|v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@ReSukiSU|v$1-$(KSU_VERSION)-Elaina@ExceSama|g' kernel/Kbuild
          # awk -v old='KSU_VERSION := $(shell expr 40000 + $(KSU_GITHUB_VERSION_COMMIT) - 2815)' -v new='KSU_VERSION := $(shell expr 10000 + $(KSU_GITHUB_VERSION_COMMIT) + 700)' '
              # index($0, old) {
                  # $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
              # }
              # { print }
          # ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
-      
-        
+
+
       - name: Set up susfs
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
@@ -275,7 +270,7 @@ jobs:
           git add -A && git commit -a -m "BUILD Kernel"
       
       - name: Add KPM Configuration Settings
-        if: ${{(github.event_name == 'schedule') || (inputs.enable_feature_x == true) && steps.check.outputs.should_cancel != 'yes'}} 
+        if: ${{ steps.check.outputs.should_cancel != 'yes' && (github.event_name == 'schedule' || inputs.enable_feature_x == true) }}
         run: |
           cd kernel_workspace/kernel_platform
           echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -289,8 +284,9 @@ jobs:
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
          cd kernel_workspace/kernel_platform
-         sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
-         sudo sed -i 's/-4k/-android15-8-ExceSama-4k/g' ./common/arch/arm64/configs/gki_defconfig
+         # 设置自定义版本标记，使用LOCALVERSION而非删除scm_version
+         export LOCALVERSION=-Elaina-ExceSama
+         echo "LOCALVERSION=$LOCALVERSION" >> $GITHUB_ENV
         
       - name: Add sched_ext
         if: steps.check.outputs.should_cancel != 'yes'
