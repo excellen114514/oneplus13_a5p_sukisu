@@ -1,3 +1,4 @@
+
 name: OnePlus_Pad2_Pro
 on:
   workflow_dispatch:
@@ -61,7 +62,8 @@ jobs:
           git clone https://github.com/ReSukiSU/ReSukiSU.git SUKI/
           cd SUKI
           KSU_GIT_VERSION=$(git rev-list --count HEAD)
-          KSU_VERSION=$((30778 + KSU_GIT_VERSION))
+          # 更新版本计算方式，与Kbuild保持一致：30000 + commit_count + 700
+          KSU_VERSION=$((30000 + KSU_GIT_VERSION + 700))
           LATEST_TAG=$(git ls-remote --tags https://github.com/excellen114514/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
           if [ $LATEST_TAG -eq $KSU_VERSION ];then
             echo "should_cancel=yes" >> $GITHUB_OUTPUT
@@ -90,18 +92,13 @@ jobs:
          cd kernel_workspace/kernel_platform
          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s builtin
          cd ./KernelSU
-         KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 30778)
+         # 更新版本计算方式，与Kbuild保持一致：30000 + commit_count + 700
+         KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 30700)
          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
          export KSU_VERSION=$KSU_VERSION
-         # 使用sed直接替换Kbuild中的版本定义字符串
-         sed -i 's|v$1-$(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD)@ReSukiSU|v$1-$(KSU_VERSION)-Elaina@ExceSama|g' kernel/Kbuild
-         # awk -v old='KSU_VERSION := $(shell expr 40000 + $(KSU_GITHUB_VERSION_COMMIT) - 2815)' -v new='KSU_VERSION := $(shell expr 10000 + $(KSU_GITHUB_VERSION_COMMIT) + 700)' '
-             # index($0, old) {
-                 # $0 = substr($0, 1, index($0, old)-1) new substr($0, index($0, old) + length(old))
-             # }
-             # { print }
-         # ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
-
+         # 不再需要修改Kbuild中的版本定义，因为Kconfig提供了KSU_FULL_NAME_FORMAT配置
+         # 设置自定义版本格式
+         echo 'CONFIG_KSU_FULL_NAME_FORMAT="v%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> ../common/arch/arm64/configs/gki_defconfig
 
       - name: Set up susfs
         if: steps.check.outputs.should_cancel != 'yes'
@@ -122,12 +119,7 @@ jobs:
            # Apply patches
            cd ./common
 
-           #sed -i 's/-32,12 +32,38/-32,11 +32,37/g' 50_add_susfs_in_gki-android15-6.6.patch
-           #sed -i '/#include <trace\/hooks\/fs.h>/d' 50_add_susfs_in_gki-android15-6.6.patch
-
            patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch || true
-           # cp ../../SukiSU_patch/hooks/scope_min_manual_hooks_v1.6.patch ./
-           # patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch
            echo "完成"
       
       - name: Apply HMBird GKI patch
@@ -228,12 +220,11 @@ jobs:
 
           # Add VFS configuration settings
           echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
-          # echo "CONFIG_KSU_MANUAL_HOOK=y" >> ./common/arch/arm64/configs/gki_defconfig
           
           # Add SUSFS configuration settings
           echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=n" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
