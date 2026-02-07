@@ -308,12 +308,66 @@ jobs:
       - name: Apply Linux Patch
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
-         cd kernel_workspace/kernel_platform/common/out/arch/arm64/boot
-         curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
-         chmod +x patch_linux
-         ./patch_linux
-         rm -f Image
-         mv oImage Image
+          cd kernel_workspace/kernel_platform/common/out/arch/arm64/boot
+          
+          # 设置最大重试次数
+          max_retries=5
+          retry_count=0
+          download_success=false
+          
+          # 重试循环
+          while [ $retry_count -lt $max_retries ] && [ "$download_success" = false ]; do
+            ((retry_count++))
+            echo "尝试第 $retry_count 次下载 patch_linux..."
+            
+            # 下载文件
+            curl -Lf https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux -o patch_linux_tmp
+            
+            # 检查下载是否成功且文件不是HTML
+            if [ $? -eq 0 ] && [ -s patch_linux_tmp ] && ! head -c 100 patch_linux_tmp | grep -q "DOCTYPE"; then
+              echo "下载成功，验证文件类型..."
+              mv patch_linux_tmp patch_linux
+              download_success=true
+            else
+              echo "第 $retry_count 次下载失败，等待 5 秒后重试..."
+              rm -f patch_linux_tmp
+              sleep 5
+            fi
+          done
+          
+          # 如果下载失败，尝试本地查找
+          if [ "$download_success" = false ]; then
+            echo "所有重试都失败，尝试从本地 SukiSU_patch 仓库查找..."
+            
+            # 检查本地仓库路径
+            local_patch_path="../../../../../../SukiSU_patch/tools/patch_linux"
+            if [ -f "$local_patch_path" ]; then
+              echo "在本地仓库找到 patch_linux，复制到当前目录..."
+              cp "$local_patch_path" patch_linux
+              download_success=true
+            fi
+          fi
+          
+          # 如果仍然失败，跳过此步骤
+          if [ "$download_success" = false ]; then
+            echo "警告：无法获取 patch_linux，跳过补丁步骤"
+            echo "原始 Image 文件将被保留"
+            exit 0
+          fi
+          
+          # 执行补丁
+          chmod +x patch_linux
+          echo "执行 patch_linux..."
+          ./patch_linux
+          
+          # 检查是否生成了 oImage
+          if [ -f oImage ]; then
+            echo "补丁成功，替换 Image 文件"
+            rm -f Image
+            mv oImage Image
+          else
+            echo "警告：patch_linux 执行但未生成 oImage，使用原始 Image"
+          fi
          
       - name: Make AnyKernel3
         if: steps.check.outputs.should_cancel != 'yes'
