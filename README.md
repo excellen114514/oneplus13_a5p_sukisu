@@ -1,4 +1,4 @@
-# 每日构建一加13T、一加平板2Pro的SukiSU内核
+# 每日构建一加平板2Pro的ReSukiSU内核
 
 ### 现已支持一加13T的ColorOS16
 
