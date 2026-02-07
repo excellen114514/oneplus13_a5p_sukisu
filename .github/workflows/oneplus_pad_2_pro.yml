@@ -204,6 +204,12 @@ jobs:
          git add -A
          git commit -m "Add HMBird GKI patch" || true
 
+      - name: Clone SukiSU_patch repository
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
+
  
       - name: Apply lz4kd Patches
         if: steps.check.outputs.should_cancel != 'yes'
