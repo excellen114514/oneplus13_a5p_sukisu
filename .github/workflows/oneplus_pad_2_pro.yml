@@ -1,3 +1,4 @@
+
 name: OnePlus_Pad2_Pro
 on:
   workflow_dispatch:
@@ -11,11 +12,6 @@ on:
         description: "跳过版本比较"
         required: false
         default: false
-        type: boolean
-      enable_susfs:
-        description: "是否启用SUSFS"
-        required: true
-        default: true
         type: boolean
   
   schedule:
@@ -105,7 +101,7 @@ jobs:
          echo 'CONFIG_KSU_FULL_NAME_FORMAT="v%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> ../common/arch/arm64/configs/gki_defconfig
 
       - name: Set up susfs
-        if: steps.check.outputs.should_cancel != 'yes' && (github.event_name == 'schedule' || inputs.enable_susfs == true)
+        if: steps.check.outputs.should_cancel != 'yes'
         run: |
            cd kernel_workspace
            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6
@@ -204,7 +200,8 @@ jobs:
          if ! grep -q "hmbird_patch.o" Makefile; then
          echo "obj-y += hmbird_patch.o" >> Makefile
          fi
-         cd ../../../..
+         # 返回到 kernel_platform 目录（Git 仓库根目录）
+         cd ../..
          git add -A
          git commit -m "Add HMBird GKI patch" || true
 
@@ -213,11 +210,11 @@ jobs:
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
           cd kernel_workspace/kernel_platform/common
-          cp ../../SukiSU_patch/other/zram/zram_patch/6.6/lz4kd.patch ./
-          patch -p1 -F 3 < lz4kd.patch || true
+            cp ../../SukiSU_patch/other/zram/zram_patch/6.6/lz4kd.patch ./
+            patch -p1 -F 3 < lz4kd.patch || true
            
       - name: Add SUSFS Configuration Settings
-        if: steps.check.outputs.should_cancel != 'yes' && (github.event_name == 'schedule' || inputs.enable_susfs == true)
+        if: steps.check.outputs.should_cancel != 'yes'
         run: |
           cd kernel_workspace/kernel_platform
           echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
