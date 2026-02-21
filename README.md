@@ -1,6 +1,6 @@
 # 每日构建一加平板2Pro的ReSukiSU内核
 
-### 现已支持一加13T的ColorOS16
+### 加入kpm与susfs，但是仅OPPad2做了修改
 
 理论上一加13、Ace5Pro通用
 
