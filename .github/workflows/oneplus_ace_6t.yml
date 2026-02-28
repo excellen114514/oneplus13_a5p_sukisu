@@ -1,4 +1,4 @@
-name: OnePlus_Ace_6T (ReSukiSU)
+name: OnePlus_Ace_6T
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: true
         type: boolean
       enable_feature_y:
-        description: "跳过版本检查直接构建"
+        description: "跳过版本比较（强制构建）"
         required: false
         default: false
         type: boolean
@@ -36,7 +36,7 @@ jobs:
       DEVICE_NAME: "OnePlus Ace 6T"
       DEVICE_CODENAME: "pineapple"
       CPU: "sm8845"
-      KERNEL_BRANCH: "android16-6.12-2025-09"  
+      KERNEL_BRANCH: "android16-6.12-2025-09"
       KANDROID_VERSION: "android16"
       KERNEL_VERSION: "6.12"
 
@@ -82,7 +82,7 @@ jobs:
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git SUKI
           cd SUKI
           KSU_GIT_VERSION=$(git rev-list --count HEAD)
-          KSU_VERSION=$((30700 + KSU_GIT_VERSION))   
+          KSU_VERSION=$((30700 + KSU_GIT_VERSION))
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           LATEST_TAG=$(git ls-remote --tags https://github.com/excellen114514/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
           if [ "$LATEST_TAG" -eq "$KSU_VERSION" ] 2>/dev/null; then
@@ -134,7 +134,7 @@ jobs:
         run: |
           cd kernel_workspace/common
           CONFIG=arch/arm64/configs/gki_defconfig
-          # KSU 基础
+          # 确保 KSU 基础选项最先出现（避免依赖问题）
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" >> $CONFIG
           # SUSFS 配置
@@ -160,8 +160,16 @@ jobs:
           if [ "${{ inputs.enable_feature_x }}" == "true" ]; then
             echo "CONFIG_KPM=y" >> $CONFIG
           fi
-          # 移除 check_defconfig 避免干扰
-          sed -i 's/check_defconfig//' ../common/build.config.gki
+          # 移除 check_defconfig 避免 defconfig 一致性检查失败
+          sed -i 's/check_defconfig//' ./build.config.gki
+
+      - name: Modules Configuration (kernel 6.12)
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace/common
+          # 禁用模块名称保护，参考 build.yml
+          sed -i '0,/protected_module_names_list *= *":gki_aarch64_protected_module_names"/s//check_defconfig = "disabled"/' \
+            BUILD.bazel || true
 
       - name: Set build timestamp
         if: steps.check.outputs.should_cancel != 'yes'
@@ -204,7 +212,6 @@ jobs:
           else
             find kernel_workspace/bazel-bin -name "Image" -exec cp {} AnyKernel3/ \;
           fi
-          # 可选：下载 SUSFS 模块
           cd AnyKernel3
           zip -r9 ../OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
           cd ..
