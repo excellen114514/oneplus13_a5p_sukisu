@@ -1,0 +1,229 @@
+name: OnePlus_Ace_6T (ReSukiSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_feature_x:
+        description: "启用 KPM (KernelPatch)"
+        required: true
+        default: true
+        type: boolean
+      enable_feature_y:
+        description: "跳过版本检查直接构建"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 22 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: resukisu-ace6t-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 8G
+      DEVICE_NAME: "OnePlus Ace 6T"
+      DEVICE_CODENAME: "pineapple"
+      CPU: "sm8845"
+      KERNEL_BRANCH: "android16-6.12-2025-09"  
+      KANDROID_VERSION: "android16"
+      KERNEL_VERSION: "6.12"
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "excellen114514"
+          git config --global user.email "xiuxianing@foxmail.com"
+          git config --global advice.detachedHead false
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends \
+            python3 git curl jq ccache zip libelf-dev build-essential flex bison libssl-dev \
+            libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix \
+            kmod libdw-dev elfutils bc cpio
+          sudo apt clean
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ runner.os }}-ace6t-${{ env.KERNEL_BRANCH }}
+          restore-keys: |
+            ccache-${{ runner.os }}-ace6t-
+            ccache-${{ runner.os }}-
+
+      - name: Compare Version (skip if forced)
+        id: check
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.enable_feature_y || github.event_name == 'schedule' }}
+        run: |
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git SUKI
+          cd SUKI
+          KSU_GIT_VERSION=$(git rev-list --count HEAD)
+          KSU_VERSION=$((30700 + KSU_GIT_VERSION))   
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          LATEST_TAG=$(git ls-remote --tags https://github.com/excellen114514/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
+          if [ "$LATEST_TAG" -eq "$KSU_VERSION" ] 2>/dev/null; then
+            echo "should_cancel=yes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install repo tool
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          repo version
+
+      - name: Initialize repo and sync (AOSP common kernel)
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-${{ env.KERNEL_BRANCH }} --depth=1 --no-clone-bundle --no-tags
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync --current-branch
+          # 移除 protected exports 避免构建问题
+          rm -f common/android/abi_gki_protected_exports_* 2>/dev/null || true
+
+      - name: Setup ReSukiSU (KernelSU)
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+          cd KernelSU
+          KSU_VERSION=$(expr $(git rev-list --count main) + 30700)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+
+      - name: Setup SUSFS (for kernel 6.12)
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android16-6.12 susfs4ksu
+          cd common
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          # 应用 SUSFS 补丁（允许失败，可能已部分应用）
+          patch -p1 --forward < 50_add_susfs_in_gki-android16-6.12.patch || true
+          cd ..
+
+      - name: Configure kernel (defconfig)
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace/common
+          CONFIG=arch/arm64/configs/gki_defconfig
+          # KSU 基础
+          echo "CONFIG_KSU=y" >> $CONFIG
+          echo "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" >> $CONFIG
+          # SUSFS 配置
+          echo "CONFIG_KSU_SUSFS=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $CONFIG
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $CONFIG
+          # 网络优化 (BBR)
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> $CONFIG
+          echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG
+          echo "CONFIG_NET_SCH_FQ=y" >> $CONFIG
+          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> $CONFIG
+          # 禁用调试
+          echo "CONFIG_DEBUG_KERNEL=n" >> $CONFIG
+          echo "CONFIG_DEBUG_INFO=n" >> $CONFIG
+          # 可选 KPM
+          if [ "${{ inputs.enable_feature_x }}" == "true" ]; then
+            echo "CONFIG_KPM=y" >> $CONFIG
+          fi
+          # 移除 check_defconfig 避免干扰
+          sed -i 's/check_defconfig//' ../common/build.config.gki
+
+      - name: Set build timestamp
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          echo "KBUILD_BUILD_TIMESTAMP=\"Tue Jun 3 03:22:33 UTC 2025\"" >> $GITHUB_ENV
+
+      - name: Build kernel with bazel
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace
+          # 使用 bazel 构建（与 build.yml 一致）
+          tools/bazel build --config=fast --lto=none --jobs=$(nproc) //common:kernel_aarch64_dist
+
+      - name: Apply KernelPatch (KPM) if enabled
+        if: steps.check.outputs.should_cancel != 'yes' && inputs.enable_feature_x == true
+        run: |
+          cd kernel_workspace
+          # 定位 Image
+          IMAGE_PATH=$(find bazel-bin -name "Image" -type f | head -1)
+          if [ -z "$IMAGE_PATH" ]; then
+            echo "Image not found!"
+            exit 1
+          fi
+          cp "$IMAGE_PATH" ./Image
+          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
+          chmod +x patch_linux
+          ./patch_linux Image
+          mv oImage Image
+          mkdir -p out/arch/arm64/boot
+          cp Image out/arch/arm64/boot/
+
+      - name: Prepare AnyKernel3
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
+          rm -rf AnyKernel3/.git
+          # 复制 Image（如果 KPM 启用则使用已修补的，否则使用 bazel 产物）
+          if [ -f "kernel_workspace/Image" ]; then
+            cp kernel_workspace/Image AnyKernel3/
+          else
+            find kernel_workspace/bazel-bin -name "Image" -exec cp {} AnyKernel3/ \;
+          fi
+          # 可选：下载 SUSFS 模块
+          cd AnyKernel3
+          zip -r9 ../OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
+          cd ..
+
+      - name: Upload AnyKernel3 as artifact
+        if: steps.check.outputs.should_cancel != 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU_${{ env.KSUVER }}_OnePlus_Ace_6T
+          path: OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip
+
+      - name: Create Release
+        if: steps.check.outputs.should_cancel != 'yes'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.run_id }}
+          body: 一加 Ace 6T SukiSU_${{ env.KSUVER }}
+          tag_name: ${{ env.KSUVER }}
+          prerelease: true
+          files: OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

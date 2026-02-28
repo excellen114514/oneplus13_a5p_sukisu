@@ -98,7 +98,7 @@ jobs:
          export KSU_VERSION=$KSU_VERSION
          # 不再需要修改Kbuild中的版本定义，因为Kconfig提供了KSU_FULL_NAME_FORMAT配置
          # 设置自定义版本格式
-         echo 'CONFIG_KSU_FULL_NAME_FORMAT="v%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> ../common/arch/arm64/configs/gki_defconfig
+         echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> ../common/arch/arm64/configs/gki_defconfig
 
       - name: Set up susfs
         if: steps.check.outputs.should_cancel != 'yes'
