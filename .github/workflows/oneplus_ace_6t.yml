@@ -1,4 +1,5 @@
 name: OnePlus_Ace_6T
+name: OnePlus_Ace_6T
 
 on:
   workflow_dispatch:
@@ -9,6 +10,7 @@ on:
         default: true
         type: boolean
       enable_feature_y:
+        description: "跳过版本比较（强制构建）"
         description: "跳过版本比较（强制构建）"
         required: false
         default: false
@@ -36,6 +38,7 @@ jobs:
       DEVICE_NAME: "OnePlus Ace 6T"
       DEVICE_CODENAME: "pineapple"
       CPU: "sm8845"
+      KERNEL_BRANCH: "android16-6.12-2025-09"
       KERNEL_BRANCH: "android16-6.12-2025-09"
       KANDROID_VERSION: "android16"
       KERNEL_VERSION: "6.12"
@@ -82,6 +85,7 @@ jobs:
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git SUKI
           cd SUKI
           KSU_GIT_VERSION=$(git rev-list --count HEAD)
+          KSU_VERSION=$((30700 + KSU_GIT_VERSION))
           KSU_VERSION=$((30700 + KSU_GIT_VERSION))
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           LATEST_TAG=$(git ls-remote --tags https://github.com/excellen114514/oneplus13_a5p_sukisu.git | tail -n1 | sed 's/.*\///')
@@ -134,6 +138,7 @@ jobs:
         run: |
           cd kernel_workspace/common
           CONFIG=arch/arm64/configs/gki_defconfig
+          # 确保 KSU 基础选项最先出现（避免依赖问题）
           # 确保 KSU 基础选项最先出现（避免依赖问题）
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" >> $CONFIG
@@ -244,3 +249,4 @@ jobs:
           files: OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
