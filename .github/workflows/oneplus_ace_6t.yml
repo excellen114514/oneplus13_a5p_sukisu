@@ -1,5 +1,5 @@
 name: OnePlus_Ace_6T
-name: OnePlus_Ace_6T
+# name: OnePlus_Ace_6T
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
         type: boolean
       enable_feature_y:
         description: "跳过版本比较（强制构建）"
-        description: "跳过版本比较（强制构建）"
+        # description: "跳过版本比较（强制构建）"
         required: false
         default: false
         type: boolean
@@ -39,7 +39,7 @@ jobs:
       DEVICE_CODENAME: "pineapple"
       CPU: "sm8845"
       KERNEL_BRANCH: "android16-6.12-2025-09"
-      KERNEL_BRANCH: "android16-6.12-2025-09"
+      # KERNEL_BRANCH: "android16-6.12-2025-09"
       KANDROID_VERSION: "android16"
       KERNEL_VERSION: "6.12"
 
