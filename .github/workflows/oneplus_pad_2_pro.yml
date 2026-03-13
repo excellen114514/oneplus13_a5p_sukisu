@@ -328,11 +328,11 @@ jobs:
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
          cd ./AnyKernel3/
-         zip -r ./OnePlus_Pad2Pro_SukiSU_${{ env.KSUVER }}.zip *
+         zip -r ./OnePlus_Pad2Pro_ReSukiSU_${{ env.KSUVER }}.zip *
 
       - name: Create Release
         if: steps.check.outputs.should_cancel != 'yes'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
          name: Release ${{ env.DATE }}
          body: 一加平板2Pro ReSukiSU_${{ env.KSUVER }}

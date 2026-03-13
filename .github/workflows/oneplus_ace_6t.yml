@@ -253,17 +253,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SukiSU_${{ env.KSUVER }}_OnePlus_Ace_6T
-          path: OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip
+          path: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
 
       - name: Create Release
         if: steps.check.outputs.should_cancel != 'yes'
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ github.run_id }}
+          name: Release ${{ env.DATE }}
           body: 一加 Ace 6T SukiSU_${{ env.KSUVER }}
           tag_name: ${{ env.KSUVER }}
-          prerelease: true
-          files: OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip
+          prerelease: false
+          files: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
