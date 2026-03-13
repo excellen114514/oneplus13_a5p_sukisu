@@ -70,7 +70,7 @@ jobs:
           sudo apt clean
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5.0.3
         with:
           path: /home/runner/.ccache
           key: ccache-${{ runner.os }}-ace6t-${{ env.KERNEL_BRANCH }}
@@ -202,36 +202,95 @@ jobs:
         if: steps.check.outputs.should_cancel != 'yes' && inputs.enable_feature_x == true
         run: |
           cd kernel_workspace
-          echo "🔍 Searching for Image in bazel-bin (preferred)..."
-          IMAGE_PATH=$(find bazel-bin -name "Image" | head -1)
-
+          echo "🔍 Searching for Image in standard bazel output paths..."
+          
+          # 方案1: 首选标准 bazel-bin dist 目录
+          IMAGE_PATH=""
+          if [ -f "bazel-bin/common/kernel_aarch64_dist/Image" ]; then
+              IMAGE_PATH="bazel-bin/common/kernel_aarch64_dist/Image"
+              echo "✅ Found Image in bazel-bin/common/kernel_aarch64_dist/"
+          
+          # 方案2: 检查 bazel-bin 子目录中的 Image
+          elif [ -d "bazel-bin/common/kernel_aarch64_dist" ]; then
+              IMAGE_PATH=$(find bazel-bin/common/kernel_aarch64_dist -name "Image" -type f 2>/dev/null | head -1)
+              if [ -n "$IMAGE_PATH" ]; then
+                  echo "✅ Found Image in bazel-bin subdir: $IMAGE_PATH"
+              fi
+          fi
+          
+          # 方案3: 检查 out/android16-*/common/ 标准输出目录
           if [ -z "$IMAGE_PATH" ]; then
-              echo "⚠️  Image not found in bazel-bin, searching entire workspace..."
-              # 递归查找整个工作区（kernel_workspace 上级目录）下的所有 Image 文件
+              OUT_IMAGE=$(find out -maxdepth 3 -path "*/common/Image" -type f 2>/dev/null | head -1)
+              if [ -n "$OUT_IMAGE" ]; then
+                  IMAGE_PATH="$OUT_IMAGE"
+                  echo "✅ Found Image in out/ directory: $IMAGE_PATH"
+              fi
+          fi
+          
+          # 方案4: 递归查找整个 bazel-bin（最后手段）
+          if [ -z "$IMAGE_PATH" ]; then
+              BAZEL_IMAGE=$(find bazel-bin -name "Image" -type f 2>/dev/null | head -1)
+              if [ -n "$BAZEL_IMAGE" ]; then
+                  IMAGE_PATH="$BAZEL_IMAGE"
+                  echo "⚠️  Found Image in bazel-bin (non-standard path): $IMAGE_PATH"
+              fi
+          fi
+          
+          # 方案5: 全工作区递归搜索（保底方案）
+          if [ -z "$IMAGE_PATH" ]; then
+              echo "⚠️  Image not found in standard paths, searching entire workspace..."
               WORKSPACE_ROOT="$GITHUB_WORKSPACE"
-              # 排除隐藏目录和 bazel-* 缓存目录，避免无关文件
               ALL_IMAGES=$(find "$WORKSPACE_ROOT" -type f -name "Image" 2>/dev/null | grep -v "/\." | grep -v "bazel-")
               
               if [ -n "$ALL_IMAGES" ]; then
                   echo "📋 Found Image(s) in workspace:"
                   echo "$ALL_IMAGES"
-                  # 取第一个作为候选
                   IMAGE_PATH=$(echo "$ALL_IMAGES" | head -1)
+                  echo "⚠️  Using first found Image (may not be the correct one): $IMAGE_PATH"
               else
                   echo "❌ No Image found anywhere in workspace!"
                   exit 1
               fi
           fi
 
-          echo "✅ Using Image: $IMAGE_PATH"
+          echo "🎯 Final Image path: $IMAGE_PATH"
+          
+          # 验证文件存在且非空
+          if [ ! -s "$IMAGE_PATH" ]; then
+              echo "❌ Image file is empty or does not exist: $IMAGE_PATH"
+              exit 1
+          fi
+          
+          # 显示 Image 信息
+          echo "📊 Image file info:"
+          ls -lh "$IMAGE_PATH"
+          file "$IMAGE_PATH" || true
+          
+          # 复制到工作目录进行 KPM 修补
           cp "$IMAGE_PATH" ./Image
-          # 后续 KPM 操作不变...
+          echo "📋 Copied to: $(pwd)/Image"
+          
+          # 下载并应用 KPM 补丁
+          echo "⬇️ Downloading KernelPatch tool..."
           curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
           chmod +x patch_linux
+          
+          echo "🔧 Applying KernelPatch..."
           ./patch_linux Image
+          
+          # 验证输出
+          if [ ! -f "oImage" ]; then
+              echo "❌ KernelPatch failed: oImage not generated"
+              exit 1
+          fi
+          
+          echo "✅ KernelPatch applied successfully"
           mv oImage Image
+          
+          # 复制到标准输出目录
           mkdir -p out/arch/arm64/boot
           cp Image out/arch/arm64/boot/
+          echo "📦 Final Image ready at: out/arch/arm64/boot/Image"
 
       - name: Prepare AnyKernel3
         if: steps.check.outputs.should_cancel != 'yes'
@@ -245,19 +304,19 @@ jobs:
             find kernel_workspace/bazel-bin -name "Image" -exec cp {} AnyKernel3/ \;
           fi
           cd AnyKernel3
-          zip -r9 ../OnePlus_Ace_6T_SukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
+          zip -r9 ../OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
           cd ..
 
       - name: Upload AnyKernel3 as artifact
         if: steps.check.outputs.should_cancel != 'yes'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SukiSU_${{ env.KSUVER }}_OnePlus_Ace_6T
           path: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
 
-      - name: Create Release
+      - name: Create Releasef
         if: steps.check.outputs.should_cancel != 'yes'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.5.0
         with:
           name: Release ${{ env.DATE }}
           body: 一加 Ace 6T SukiSU_${{ env.KSUVER }}
