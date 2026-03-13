@@ -21,21 +21,27 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
 
-      - name: Delete old releases and tags
+      - name: Delete all releases and tags
         run: |
-          cutoff=$(date -d '14 days ago' +%s)
-
+          # 删除所有 Release 及其关联的 Tag
+          echo "Fetching all releases..."
           gh api repos/${{ github.repository }}/releases --paginate \
-          | jq -c '.[] | {id: .id, tag_name: .tag_name, created_at: .created_at}' \
+          | jq -c '.[] | {id: .id, tag_name: .tag_name}' \
           | while read release; do
-              created=$(echo $release | jq -r '.created_at')
-              created_ts=$(date -d "$created" +%s)
-              if [ $created_ts -lt $cutoff ]; then
-                id=$(echo $release | jq -r '.id')
-                tag=$(echo $release | jq -r '.tag_name')
-                echo "Deleting release $id (tag: $tag)..."
-                gh api --method DELETE repos/${{ github.repository }}/releases/$id
-                echo "Deleting tag $tag..."
-                gh api --method DELETE repos/${{ github.repository }}/git/refs/tags/$tag || true
-              fi
+              id=$(echo $release | jq -r '.id')
+              tag=$(echo $release | jq -r '.tag_name')
+              echo "Deleting release $id (tag: $tag)..."
+              gh api --method DELETE repos/${{ github.repository }}/releases/$id
+              echo "Deleting tag $tag (if exists)..."
+              gh api --method DELETE repos/${{ github.repository }}/git/refs/tags/$tag || true
+            done
+
+          # 删除所有剩余的 Tag（那些没有对应 Release 的 Tag）
+          echo "Fetching all tags to clean up any leftovers..."
+          gh api repos/${{ github.repository }}/git/refs/tags --paginate \
+          | jq -r '.[].ref' \
+          | while read ref; do
+              tag_name=$(echo $ref | sed 's#refs/tags/##')
+              echo "Deleting tag $tag_name..."
+              gh api --method DELETE repos/${{ github.repository }}/git/refs/tags/$tag_name || true
             done
