@@ -199,7 +199,7 @@ jobs:
           tools/bazel build --config=fast --lto=none --jobs=$(nproc) //common:kernel_aarch64_dist
 
       - name: Apply KernelPatch (KPM) if enabled
-        if: steps.check.outputs.should_cancel != 'yes' && inputs.enable_feature_x == true
+        if: ${{ steps.check.outputs.should_cancel != 'yes' && (github.event_name == 'schedule' || inputs.enable_feature_x == true) }}
         run: |
           cd kernel_workspace
           echo "🔍 Searching for Image in standard bazel output paths..."
@@ -314,7 +314,7 @@ jobs:
           name: SukiSU_${{ env.KSUVER }}_OnePlus_Ace_6T
           path: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
 
-      - name: Create Releasef
+      - name: Create Release
         if: steps.check.outputs.should_cancel != 'yes'
         uses: softprops/action-gh-release@v2.5.0
         with:
