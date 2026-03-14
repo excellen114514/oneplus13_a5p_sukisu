@@ -138,8 +138,6 @@ jobs:
         run: |
           cd kernel_workspace/common
           CONFIG=arch/arm64/configs/gki_defconfig
-          # 确保 KSU 基础选项最先出现（避免依赖问题）
-          # 确保 KSU 基础选项最先出现（避免依赖问题）
           echo "CONFIG_KSU=y" >> $CONFIG
           echo "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" >> $CONFIG
           # SUSFS 配置
@@ -153,7 +151,6 @@ jobs:
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $CONFIG
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $CONFIG
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $CONFIG
-          # 网络优化 (BBR)
           echo "CONFIG_TCP_CONG_ADVANCED=y" >> $CONFIG
           echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG
           echo "CONFIG_NET_SCH_FQ=y" >> $CONFIG
@@ -164,6 +161,10 @@ jobs:
           # 禁用调试
           echo "CONFIG_DEBUG_KERNEL=n" >> $CONFIG
           echo "CONFIG_DEBUG_INFO=n" >> $CONFIG
+          #后缀自定义
+          echo 'CONFIG_LOCALVERSION="-Elaina-ExceSama"' >> $CONFIG
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> $CONFIG
+          echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> $CONFIG
           # 可选 KPM
           if [ "${{ inputs.enable_feature_x }}" == "true" ]; then
             echo "CONFIG_KPM=y" >> $CONFIG
@@ -185,6 +186,13 @@ jobs:
       #     wget https://github.com/bazelbuild/buildtools/releases/latest/download/buildozer-linux-amd64 -O buildozer
       #     chmod +x buildozer
       #     ./buildozer 'add module_outs net/ipv4/tcp_westwood.ko net/ipv4/tcp_htcp.ko net/ipv4/tcp_bic.ko' //common:kernel_aarch64
+
+      - name: Commit modifications to clean tree
+        if: steps.check.outputs.should_cancel != 'yes'
+        run: |
+          cd kernel_workspace
+          git add -A
+          git commit -m "Apply KernelSU, SUSFS and config changes"
 
       - name: Set build timestamp
         if: steps.check.outputs.should_cancel != 'yes'
