@@ -190,7 +190,7 @@ jobs:
       - name: Commit modifications to clean tree
         if: steps.check.outputs.should_cancel != 'yes'
         run: |
-          cd kernel_workspace
+          cd kernel_workspace/common
           git add -A
           git commit -m "Apply KernelSU, SUSFS and config changes"
 
