@@ -327,7 +327,7 @@ jobs:
         uses: softprops/action-gh-release@v2.5.0
         with:
           name: Release ${{ env.DATE }}
-          body: 一加 Ace 6T SukiSU_${{ env.KSUVER }}
+          body: 一加平板2Pro ReSukiSU_${{ env.KSUVER }},一加 Ace 6T ReSukiSU_${{ env.KSUVER }}
           tag_name: ${{ env.KSUVER }}
           prerelease: false
           files: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip

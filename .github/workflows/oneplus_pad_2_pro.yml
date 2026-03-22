@@ -335,7 +335,7 @@ jobs:
         uses: softprops/action-gh-release@v2.5.0
         with:
          name: Release ${{ env.DATE }}
-         body: 一加平板2Pro ReSukiSU_${{ env.KSUVER }}
+         body: 一加平板2Pro ReSukiSU_${{ env.KSUVER }},一加 Ace 6T ReSukiSU_${{ env.KSUVER }}
          tag_name: ${{ env.KSUVER }}
          prerelease: false
          files: ./AnyKernel3/*.zip
