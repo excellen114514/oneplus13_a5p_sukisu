@@ -1,5 +1,4 @@
 name: OnePlus_Ace_6T
-# name: OnePlus_Ace_6T
 
 on:
   workflow_dispatch:
@@ -33,7 +32,6 @@ jobs:
       DEVICE_CODENAME: "pineapple"
       CPU: "sm8845"
       KERNEL_BRANCH: "android16-6.12-2025-09"
-      # KERNEL_BRANCH: "android16-6.12-2025-09"
       KANDROID_VERSION: "android16"
       KERNEL_VERSION: "6.12"
 
@@ -189,34 +187,46 @@ jobs:
           tools/bazel build --config=fast --lto=none --jobs=$(nproc) //common:kernel_aarch64_dist
 
       - name: Apply KernelPatch (KPM) if enabled
-        if: ${{(github.event_name == 'schedule' || inputs.enable_feature_x == true) }}
+        if: ${{ github.event_name == 'schedule' || inputs.enable_feature_x == true }}
         run: |
-            cd kernel_workspace
+          cd kernel_workspace
+          IMAGE_PATH="bazel-bin/common/kernel_aarch64/Image"
+          if [ ! -f "$IMAGE_PATH" ]; then
             IMAGE_PATH="bazel-bin/common/kernel_aarch64_dist/Image"
-            if [ ! -f "$IMAGE_PATH" ]; then
-              IMAGE_PATH=$(find bazel-bin -name "Image" -type f | head -1)
-            fi
-             if [ ! -f "$IMAGE_PATH" ]; then
-              echo "❌ Image not found" && exit 1
-            fi
-             echo "🎯 Using Image: $IMAGE_PATH"
-            cp "$IMAGE_PATH" Image
-            curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
-            chmod +x patch_linux
-             ./patch_linux Image
-            mv oImage Image
-            mkdir -p out/arch/arm64/boot
-            cp Image out/arch/arm64/boot/
+          fi
+          if [ ! -f "$IMAGE_PATH" ]; then
+            echo "❌ Image not found" && exit 1
+          fi
+          echo "🎯 Using Image: $IMAGE_PATH"
+          cp "$IMAGE_PATH" Image
+          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
+          chmod +x patch_linux
+          ./patch_linux Image
+          mv oImage Image
+          mkdir -p out/arch/arm64/boot
+          cp Image out/arch/arm64/boot/
 
-      - name: Prepare AnyKernel3
+      # - name: Prepare AnyKernel3
       
+      #   run: |
+      #     git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
+      #     rm -rf AnyKernel3/.git
+      #     if [ -f "kernel_workspace/Image" ]; then
+      #       cp kernel_workspace/Image AnyKernel3/
+      #     else
+      #       cp kernel_workspace/bazel-bin/common/kernel_aarch64_dist/Image AnyKernel3/
+      #     fi
+      #     cd AnyKernel3
+      #     zip -r9 ../OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
+      #     cd ..
+      - name: Prepare AnyKernel3
         run: |
           git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
           rm -rf AnyKernel3/.git
           if [ -f "kernel_workspace/Image" ]; then
             cp kernel_workspace/Image AnyKernel3/
           else
-            cp kernel_workspace/bazel-bin/common/kernel_aarch64_dist/Image AnyKernel3/
+            cp kernel_workspace/bazel-bin/common/kernel_aarch64/Image AnyKernel3/
           fi
           cd AnyKernel3
           zip -r9 ../OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
