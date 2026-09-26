@@ -3,8 +3,28 @@ name: OnePlus_Ace_6T
 on:
   workflow_dispatch:
     inputs:
-      enable_feature_x:
-        description: "启用 KPM (KernelPatch)"
+      ksu_setup_branch:
+        description: "🌿 ReSukiSU setup.sh 分支"
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - dev
+      ksu_meta:
+        description: "📦 ReSukiSU 源码: 分支/自定义Tag/可选Commit"
+        required: false
+        default: "main/⚡Ultra⚡/"
+      susfs_meta:
+        description: "🔒 SUSFS 版本: 留空=最新 | 提交哈希或 HEAD~N=回滚 | -1=禁用"
+        required: false
+        default: ""
+      kernel_suffix:
+        description: "🏷️ 内核后缀: 留空=该 GKI 发行版原厂后缀 | -1=禁用 | 也可自定义"
+        required: false
+        default: ""
+      create_release:
+        description: "📤 发布 GitHub Release"
         required: true
         default: true
         type: boolean
@@ -20,16 +40,23 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
       CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: 8G
+      # 自由格式输入统一转成环境变量，避免直接拼接进脚本产生注入风险
+      KSU_SETUP_BRANCH: ${{ inputs.ksu_setup_branch || 'main' }}
+      KSU_META: ${{ inputs.ksu_meta || 'main/⚡Ultra⚡/' }}
+      SUSFS_META: ${{ inputs.susfs_meta }}
+      KERNEL_SUFFIX: ${{ inputs.kernel_suffix }}
+      DEVICE_ID: "ace6t"
       DEVICE_NAME: "OnePlus Ace 6T"
-      DEVICE_CODENAME: "pineapple"
+      DEVICE_NAME_SAFE: "OnePlusAce6T"
+      DEVICE_CODENAME: "macan"
       CPU: "sm8845"
       KERNEL_BRANCH: "android16-6.12-2025-09"
       KANDROID_VERSION: "android16"
@@ -54,200 +81,563 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y --no-install-recommends \
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
             python3 git curl jq ccache zip libelf-dev build-essential flex bison libssl-dev \
             libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix \
-            kmod libdw-dev elfutils bc cpio
-          sudo apt clean
+            kmod libdw-dev elfutils bc cpio wget
+          sudo apt-get clean
+
+      - name: Install repo tool
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 \
+            https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/repo"
+          chmod a+x "$HOME/repo"
+          sudo mv "$HOME/repo" /usr/local/bin/repo
+          repo version | head -1 || true
+
+      - name: Initialize repo and sync (AOSP common kernel)
+        run: |
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          retry_command() {
+            local max_attempts=3 timeout_s=5 attempt=1
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "🔄 Attempt $attempt/$max_attempts: $*"
+              if "$@"; then return 0; fi
+              echo "⏳ Retrying in ${timeout_s}s..."
+              sleep "$timeout_s"
+              timeout_s=$((timeout_s * 2))
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          retry_command repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "common-${KERNEL_BRANCH}" --depth=1 --no-clone-bundle --no-tags
+
+          # 上游会把过期的 GKI 分支挪到 deprecated/ 下，导致 repo sync 报
+          # "couldn't find remote ref"。用 local_manifest 重定向即可。
+          COMMON_URL="https://android.googlesource.com/kernel/common"
+          if ! git ls-remote --exit-code --heads "$COMMON_URL" "refs/heads/${KERNEL_BRANCH}" >/dev/null 2>&1 \
+             && git ls-remote --exit-code --heads "$COMMON_URL" "refs/heads/deprecated/${KERNEL_BRANCH}" >/dev/null 2>&1; then
+            echo "⚠️ common-${KERNEL_BRANCH} 已归档，重定向到 deprecated/${KERNEL_BRANCH}"
+            mkdir -p .repo/local_manifests
+            {
+              echo '<?xml version="1.0" encoding="UTF-8"?>'
+              echo '<manifest>'
+              echo "  <extend-project name=\"kernel/common\" revision=\"deprecated/${KERNEL_BRANCH}\" />"
+              echo '</manifest>'
+            } > .repo/local_manifests/deprecated-redirect.xml
+          else
+            rm -f .repo/local_manifests/deprecated-redirect.xml 2>/dev/null || true
+          fi
+
+          SYNC_JOBS="$(nproc)"
+          [ "$SYNC_JOBS" -gt 8 ] && SYNC_JOBS=8
+
+          set +e
+          repo sync -c -j"${SYNC_JOBS}" --prune --no-clone-bundle --no-tags \
+            --force-sync --current-branch --optimized-fetch --retry-fetches=3
+          SYNC_STATUS=$?
+          set -e
+
+          if [ "$SYNC_STATUS" -ne 0 ]; then
+            echo "⚠️ 首次 repo sync 失败，清理 prebuilts 后用 -j1 重试"
+            rm -rf prebuilts/clang prebuilts/gcc \
+              .repo/projects/prebuilts/clang/host/linux-x86.git \
+              .repo/projects/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8.git
+            repo sync -c -j1 --fail-fast --prune --no-clone-bundle --no-tags \
+              --force-sync --current-branch --optimized-fetch --retry-fetches=3
+          fi
+
+          # 移除 protected exports / module names 限制，避免构建失败
+          rm -f common/android/abi_gki_protected_exports_* 2>/dev/null || true
 
       - name: Restore ccache
-        uses: actions/cache@v5.0.3
+        uses: actions/cache@v6
         with:
           path: /home/runner/.ccache
-          key: ccache-${{ runner.os }}-ace6t-${{ env.KERNEL_BRANCH }}
+          key: ccache-${{ runner.os }}-ace6t-${{ env.KERNEL_BRANCH }}-${{ github.run_id }}
           restore-keys: |
+            ccache-${{ runner.os }}-ace6t-${{ env.KERNEL_BRANCH }}-
             ccache-${{ runner.os }}-ace6t-
             ccache-${{ runner.os }}-
 
-      
-
-      - name: Install repo tool
-         
+      - name: Kernel version handling
         run: |
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
-          chmod a+x ~/repo
-          sudo mv ~/repo /usr/local/bin/repo
-          repo version
-
-      - name: Initialize repo and sync (AOSP common kernel)
-         
-        run: |
-          mkdir kernel_workspace && cd kernel_workspace
-          repo init -u https://android.googlesource.com/kernel/manifest \
-            -b common-${{ env.KERNEL_BRANCH }} --depth=1 --no-clone-bundle --no-tags
-          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync --current-branch
-          # 移除 protected exports 避免构建问题
-          rm -f common/android/abi_gki_protected_exports_* 2>/dev/null || true
-
-      - name: Setup ReSukiSU (KernelSU)
-         
-        run: |
+          set -euo pipefail
           cd kernel_workspace
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
-          cd KernelSU
-          KSU_VERSION=$(expr $(git rev-list --count main) + 30700)
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
 
-      - name: Setup SUSFS (for kernel 6.12)
-         
+          BRANCH=""
+          for f in ./common/build.config.constants ./common/build.config.common; do
+            if [ -f "$f" ]; then
+              BRANCH="$(grep -m1 '^BRANCH=' "$f" | cut -d= -f2 || true)"
+              [ -n "$BRANCH" ] && break
+            fi
+          done
+
+          if [ -n "$BRANCH" ]; then
+            KANDROID="${BRANCH%%-*}"
+            KVER="${BRANCH#"${KANDROID}-"}"
+          else
+            KANDROID="android16"
+            KVER="6.12"
+          fi
+
+          TKERNEL_VERSION="$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)"
+
+          {
+            echo "KANDROID_VERSION=${KANDROID}"
+            echo "KERNEL_VERSION=${KVER}"
+            echo "TKERNEL_VERSION=${TKERNEL_VERSION}"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ ${KANDROID}-${KVER} (${TKERNEL_VERSION})"
+
+      - name: Install ReSukiSU
         run: |
+          set -euo pipefail
+
           cd kernel_workspace
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android16-6.12 susfs4ksu
-          cd common
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          # 应用 SUSFS 补丁（允许失败，可能已部分应用）
-          patch -p1 --forward < 50_add_susfs_in_gki-android16-6.12.patch || true
+
+          IFS='/' read -r KSU_BRANCH KSU_CUSTOM_TAG MANUAL_HASH <<< "${KSU_META}"
+          KSU_BRANCH="${KSU_BRANCH:-main}"
+
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/ksu_setup.sh \
+            "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/${KSU_SETUP_BRANCH}/kernel/setup.sh"
+
+          # setup.sh 会克隆 KernelSU、创建 drivers/kernelsu 软链并写入 Makefile/Kconfig
+          bash /tmp/ksu_setup.sh "${KSU_BRANCH:-main}"
+
+          [ -e ./common/drivers/kernelsu ] || { echo "❌ drivers/kernelsu 软链创建失败"; exit 1; }
+          grep -q "kernelsu" ./common/drivers/Makefile || { echo "❌ drivers/Makefile 未接入 KernelSU"; exit 1; }
+          grep -q "drivers/kernelsu/Kconfig" ./common/drivers/Kconfig || { echo "❌ drivers/Kconfig 未接入 KernelSU"; exit 1; }
+
+          cd ./KernelSU
+
+          if [ -n "${MANUAL_HASH:-}" ]; then
+            git fetch origin "$KSU_BRANCH" --depth=100
+            git checkout "$MANUAL_HASH"
+          fi
+
+          KSU_COMMIT_SHA="$(git rev-parse HEAD)"
+          KSU_VERSION=$(( $(git rev-list --count HEAD 2>/dev/null || echo 13000) + 30700 ))
+
+          {
+            echo "KSU_CUSTOM_TAG=${KSU_CUSTOM_TAG}"
+            echo "KSU_COMMIT_SHA=${KSU_COMMIT_SHA}"
+            echo "KSUVER=${KSU_VERSION}"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ ReSukiSU ${KSU_BRANCH} @ ${KSU_COMMIT_SHA} -> ${KSU_VERSION}"
+
+      - name: Apply SUSFS patches
+        run: |
+          set -euo pipefail
+
+          cd kernel_workspace
+
+          if [ "${SUSFS_META}" = "-1" ]; then
+            echo "⏭️ SUSFS 已禁用"
+            # 后续步骤用 ${{ env.SUSVER }} / ${{ env.SUSFS_BRANCH_NAME }} 渲染 Release 与摘要，
+            # 这里补上占位值，避免禁用 SUSFS 时这两处渲染成空字符串
+            {
+              echo "SUSVER=noSUSFS"
+              echo "SUSFS_BRANCH_NAME=none"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          SUSFS_BRANCH="gki-${KANDROID_VERSION}-${KERNEL_VERSION}"
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          cd susfs4ksu
+          if [ -n "${SUSFS_META}" ]; then
+            if [[ "$SUSFS_META" =~ ^[0-9]+$ ]]; then
+              git fetch --depth=50 origin "$SUSFS_BRANCH"
+              git checkout "HEAD~${SUSFS_META}"
+            else
+              git fetch --depth=50 origin "$SUSFS_META" 2>/dev/null || true
+              git checkout "$SUSFS_META"
+            fi
+          fi
+
+          SUSFS_COMMIT_SHA="$(git rev-parse HEAD)"
+          SUSFS_SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          SUSFS_PATCH="50_add_susfs_in_gki-${KANDROID_VERSION}-${KERNEL_VERSION}.patch"
+
+          SUSVER="$(grep -RhoE 'SUSFS_VERSION[[:space:]]*["= ]+[vV]?[0-9]+\.[0-9]+\.[0-9]+[+A-Za-z0-9._-]*' . 2>/dev/null \
+            | head -n1 | grep -oE '[vV]?[0-9]+\.[0-9]+\.[0-9]+[+A-Za-z0-9._-]*' || true)"
+          [ -n "$SUSVER" ] || SUSVER="unknown-${SUSFS_SHORT_SHA}"
+
+          {
+            echo "SUSFS_BRANCH_NAME=${SUSFS_BRANCH}"
+            echo "SUSFS_PATCH=${SUSFS_PATCH}"
+            echo "SUSFS_COMMIT_SHA=${SUSFS_COMMIT_SHA}"
+            echo "SUSFS_SHORT_SHA=${SUSFS_SHORT_SHA}"
+            echo "SUSVER=${SUSVER}"
+          } >> "$GITHUB_ENV"
+
           cd ..
+
+          [ -f "./susfs4ksu/kernel_patches/${SUSFS_PATCH}" ] || { echo "❌ 找不到 ${SUSFS_PATCH}"; exit 1; }
+
+          cp "./susfs4ksu/kernel_patches/${SUSFS_PATCH}" ./common/
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+
+          cd common
+
+          # 先 dry-run，再真正应用，避免 patch 半途失败留下脏树
+          if patch -p1 --dry-run -F 3 < "$SUSFS_PATCH" >/dev/null 2>&1; then
+            patch -p1 -F 3 < "$SUSFS_PATCH"
+            echo "✅ SUSFS 补丁应用成功"
+          elif patch -p1 -R --dry-run -F 3 < "$SUSFS_PATCH" >/dev/null 2>&1; then
+            echo "✅ SUSFS 补丁已应用，跳过"
+          else
+            echo "❌ SUSFS 补丁无法应用"
+            exit 1
+          fi
+
+          echo "✅ SUSFS ${SUSVER} (${SUSFS_BRANCH}) @ ${SUSFS_COMMIT_SHA}"
 
       - name: Configure kernel (defconfig)
-         
         run: |
+          set -euo pipefail
+
           cd kernel_workspace/common
           CONFIG=arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU=y" >> $CONFIG
-          echo "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" >> $CONFIG
-          # SUSFS 配置
-          echo "CONFIG_KSU_SUSFS=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $CONFIG
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $CONFIG
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> $CONFIG
-          echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG
-          echo "CONFIG_NET_SCH_FQ=y" >> $CONFIG
-          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> $CONFIG
-          echo "# CONFIG_TCP_CONG_WESTWOOD is not set" >> $CONFIG
-          echo "# CONFIG_TCP_CONG_HTCP is not set" >> $CONFIG
-          echo "# CONFIG_TCP_CONG_BIC is not set" >> $CONFIG
-          # 禁用调试
-          echo "CONFIG_DEBUG_KERNEL=n" >> $CONFIG
-          echo "CONFIG_DEBUG_INFO=n" >> $CONFIG
-          #后缀自定义
-          echo 'CONFIG_LOCALVERSION="-Elaina-ExceSama"' >> $CONFIG
-          echo "CONFIG_LOCALVERSION_AUTO=n" >> $CONFIG
-          echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%-Elaina@ExceSama"' >> $CONFIG
-          # 可选 KPM
-          if [ "${{ inputs.enable_feature_x }}" == "true" ]; then
-            echo "CONFIG_KPM=y" >> $CONFIG
-          fi
-          # 移除 check_defconfig 避免 defconfig 一致性检查失败
-          sed -i 's/check_defconfig//' ./build.config.gki
 
-      - name: Modules Configuration (kernel 6.12)
-         
+          force_config() {
+            local entry="$1" key="${1%%=*}"
+            sed -i "/^${key}=/d" "$CONFIG" 2>/dev/null || true
+            echo "$entry" >> "$CONFIG"
+          }
+
+          append_config() {
+            local entry="$1" key="${1%%=*}"
+            grep -qE "^${key}=" "$CONFIG" 2>/dev/null || echo "$entry" >> "$CONFIG"
+          }
+
+          echo "# === ReSukiSU ===" >> "$CONFIG"
+          append_config "CONFIG_KSU=y"
+          append_config "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y"
+          # ReSukiSU 自 2026-06 起已彻底移除 KPM/KernelPatch 支持，显式关闭避免残留
+          force_config "CONFIG_KPM=n"
+
+          if [ -n "${KSU_CUSTOM_TAG:-}" ]; then
+            force_config "CONFIG_KSU_FULL_NAME_FORMAT=\"%TAG_NAME%-${KSU_CUSTOM_TAG}@main[%COMMIT_SHA%]\""
+          fi
+
+          if [ "${SUSFS_META}" != "-1" ]; then
+            echo "# === SUSFS ===" >> "$CONFIG"
+            append_config "CONFIG_KSU_SUSFS=y"
+            append_config "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            append_config "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            append_config "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            append_config "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            append_config "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            append_config "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            append_config "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            append_config "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            # GKI 上开启会因符号裁剪导致 unresolved symbol，必须保持关闭
+            force_config "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=n"
+          else
+            force_config "CONFIG_KSU_SUSFS=n"
+          fi
+
+          echo "# === Network (BBR) ===" >> "$CONFIG"
+          append_config "CONFIG_TCP_CONG_ADVANCED=y"
+          append_config "CONFIG_TCP_CONG_BBR=y"
+          append_config "CONFIG_NET_SCH_FQ=y"
+          force_config "CONFIG_DEFAULT_TCP_CONG=\"bbr\""
+          force_config "CONFIG_TCP_CONG_WESTWOOD=n"
+          force_config "CONFIG_TCP_CONG_HTCP=n"
+          force_config "CONFIG_TCP_CONG_BIC=n"
+
+          echo "# === Debug disabled ===" >> "$CONFIG"
+          force_config "CONFIG_DEBUG_KERNEL=n"
+          force_config "CONFIG_DEBUG_INFO=n"
+          force_config "CONFIG_LOCALVERSION_AUTO=n"
+
+          # 移除 check_defconfig 避免 defconfig 一致性检查失败
+          sed -i 's/check_defconfig//' ./build.config.gki || true
+
+      - name: Apply kernel suffix
         run: |
+          set -euo pipefail
+
+          cd kernel_workspace
+
+          if [ "${KERNEL_SUFFIX}" = "-1" ]; then
+            echo "⏭️ 内核后缀已禁用"
+            exit 0
+          elif [ -n "${KERNEL_SUFFIX}" ]; then
+            SUFFIX="${KERNEL_SUFFIX}"
+          else
+            case "${KERNEL_BRANCH}" in
+              android16-6.12-2025-06) SUFFIX="5-gb2a876903b49-ab14541642-4k" ;;
+              android16-6.12-2025-09) SUFFIX="5-g844001fb8721-ab14552068-4k" ;;
+              android16-6.12-2025-12) SUFFIX="6-g925a103d123c-ab15898589-4k" ;;
+              *) SUFFIX="" ;;
+            esac
+          fi
+
+          if [ -z "$SUFFIX" ]; then
+            RANDOM_DIGIT=$(od -An -N1 -tu1 < /dev/urandom | tr -d '[:space:]' | awk '{print $1 % 11}')
+            RANDOM_HASH=$(od -An -N7 -tx1 /dev/urandom | tr -d ' \n')
+            SUFFIX="${RANDOM_DIGIT}-o-g${RANDOM_HASH}"
+          fi
+
+          echo "KERNEL_SUFFIX_USED=${SUFFIX}" >> "$GITHUB_ENV"
+
+          apply_suffix() {
+            local path="$1"
+            [ -f "$path" ] || return 0
+
+            sed -i 's/ -dirty//g' "$path"
+            grep -q 'res=$(echo "$res" | sed' "$path" || \
+              sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$path"
+
+            if grep -q 'KERNELVERSION.*scm_version' "$path"; then
+              sed -i "s|echo \"\${KERNELVERSION}.*scm_version}\"|echo \"\${KERNELVERSION}-${KANDROID_VERSION}-${SUFFIX}\"|" "$path"
+            elif grep -q 'echo "\$res"' "$path"; then
+              tac "$path" | sed "0,/echo \"\\\$res\"/s//res=\\\$(echo \\\$res | cut -d- -f1-2)-${SUFFIX}; echo \"\\\$res\";/" | tac > "$path.tmp" \
+                && mv "$path.tmp" "$path"
+            else
+              echo "echo \"\$res-${SUFFIX}\"" >> "$path"
+            fi
+
+            chmod +x "$path"
+          }
+
+          apply_suffix "common/scripts/setlocalversion"
+          apply_suffix "msm-kernel/scripts/setlocalversion"
+
+          echo "🏷️ 内核后缀: ${SUFFIX}"
+
+      - name: Modules configuration (kernel 6.12)
+        run: |
+          set -euo pipefail
+
+          BUILD_FILE="kernel_workspace/common/BUILD.bazel"
+          [ -f "$BUILD_FILE" ] || exit 0
+
+          # 与参考实现一致地移除 protected exports / module names 限制
+          sed -i '/protected_module_names_list[[:space:]]*=[[:space:]]*":gki_aarch64_protected_module_names"/d' "$BUILD_FILE" || true
+          sed -i '/protected_exports_list[[:space:]]*=[[:space:]]*"android\/abi_gki_protected_exports_aarch64"/d' "$BUILD_FILE" || true
+          sed -i '/"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64"/d' "$BUILD_FILE" || true
+
+          echo "🔎 BUILD.bazel 中剩余的 protected 限制:"
+          grep -n "protected" "$BUILD_FILE" || echo "（已全部移除）"
+
+      - name: Verify important config entries
+        run: |
+          set -euo pipefail
+
           cd kernel_workspace/common
-          # 禁用模块名称保护，参考 build.yml
-          sed -i '0,/protected_module_names_list *= *":gki_aarch64_protected_module_names"/s//check_defconfig = "disabled"/' \
-            BUILD.bazel || true
-      # - name: Add missing modules to module_outs
-      #    
-      #   run: |
-      #     cd kernel_workspace
-      #     wget https://github.com/bazelbuild/buildtools/releases/latest/download/buildozer-linux-amd64 -O buildozer
-      #     chmod +x buildozer
-      #     ./buildozer 'add module_outs net/ipv4/tcp_westwood.ko net/ipv4/tcp_htcp.ko net/ipv4/tcp_bic.ko' //common:kernel_aarch64
+          CONFIG_FILE="./arch/arm64/configs/gki_defconfig"
+
+          echo "🔎 关键 defconfig 条目:"
+          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT=' "$CONFIG_FILE" || true
+
+          grep -q '^CONFIG_KSU=y' "$CONFIG_FILE" || { echo "❌ CONFIG_KSU=y 缺失"; exit 1; }
+          if grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' "$CONFIG_FILE"; then
+            echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 不应为 y"
+            exit 1
+          fi
+          if grep -q '^CONFIG_KPM=y' "$CONFIG_FILE"; then
+            echo "❌ CONFIG_KPM=y 不应存在（KPM 支持已移除）"
+            exit 1
+          fi
 
       - name: Commit modifications to clean tree
-         
         run: |
+          set -euo pipefail
           cd kernel_workspace/common
           git add -A
-          git commit -m "Apply KernelSU, SUSFS and config changes"
+          git commit -m "Apply ReSukiSU, SUSFS and config changes" || true
 
       - name: Set build timestamp
-         
         run: |
-          echo "KBUILD_BUILD_TIMESTAMP=\"Tue Jun 3 03:22:33 UTC 2025\"" >> $GITHUB_ENV
-           echo "DATE=$(date +%F)" >> $GITHUB_ENV 
+          echo "KBUILD_BUILD_TIMESTAMP=\"$(TZ='UTC' date +'%a %b %d %T %Z %Y')\"" >> "$GITHUB_ENV"
+          echo "KBUILD_BUILD_VERSION=1" >> "$GITHUB_ENV"
+          echo "DATE=$(date +%F)" >> "$GITHUB_ENV"
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/bazel-disk
+            ~/.cache/bazel-repo
+          key: bazel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
       - name: Build kernel with bazel
-         
         run: |
-          cd kernel_workspace
-          # 使用 bazel 构建（与 build.yml 一致）
-          tools/bazel build --config=fast --lto=none --jobs=$(nproc) //common:kernel_aarch64_dist
+          set -euo pipefail
 
-      - name: Apply KernelPatch (KPM) if enabled
-        if: ${{ github.event_name == 'schedule' || inputs.enable_feature_x == true }}
+          mkdir -p ~/.cache/bazel-disk ~/.cache/bazel-repo
+          cd kernel_workspace
+
+          BUILD_THREADS="$(( $(nproc) + 2 ))"
+          echo "BUILD_THREADS=${BUILD_THREADS}" >> "$GITHUB_ENV"
+          export MAKEFLAGS="-j${BUILD_THREADS}"
+
+          echo "🚀 开始编译 $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "📱 ${DEVICE_NAME} (${DEVICE_CODENAME}) | 🔒 SUSFS ${SUSVER:-N/A}"
+
+          tools/bazel build \
+            --config=fast \
+            --lto=none \
+            --jobs="${BUILD_THREADS}" \
+            --disk_cache="${HOME}/.cache/bazel-disk" \
+            --repository_cache="${HOME}/.cache/bazel-repo" \
+            --show_result=20 \
+            --verbose_failures \
+            //common:kernel_aarch64_dist
+
+          echo "✅ 编译完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Trim Bazel disk cache
+        if: always()
         run: |
-          cd kernel_workspace
-          IMAGE_PATH="bazel-bin/common/kernel_aarch64/Image"
-          if [ ! -f "$IMAGE_PATH" ]; then
-            IMAGE_PATH="bazel-bin/common/kernel_aarch64_dist/Image"
-          fi
-          if [ ! -f "$IMAGE_PATH" ]; then
-            echo "❌ Image not found" && exit 1
-          fi
-          echo "🎯 Using Image: $IMAGE_PATH"
-          cp "$IMAGE_PATH" Image
-          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
-          chmod +x patch_linux
-          ./patch_linux Image
-          mv oImage Image
-          mkdir -p out/arch/arm64/boot
-          cp Image out/arch/arm64/boot/
+          set -euo pipefail
+          CACHE_DIR="${HOME}/.cache/bazel-disk"
+          LIMIT_MB=3500
+          [ -d "$CACHE_DIR" ] || exit 0
 
-      # - name: Prepare AnyKernel3
-      
-      #   run: |
-      #     git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
-      #     rm -rf AnyKernel3/.git
-      #     if [ -f "kernel_workspace/Image" ]; then
-      #       cp kernel_workspace/Image AnyKernel3/
-      #     else
-      #       cp kernel_workspace/bazel-bin/common/kernel_aarch64_dist/Image AnyKernel3/
-      #     fi
-      #     cd AnyKernel3
-      #     zip -r9 ../OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
-      #     cd ..
+          SIZE_MB=$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1)
+          echo "Bazel 磁盘缓存: ${SIZE_MB} MiB (限制 ${LIMIT_MB} MiB)"
+
+          if [ "${SIZE_MB:-0}" -gt "$LIMIT_MB" ]; then
+            find "$CACHE_DIR" -type f -printf '%T@ %s %p\n' 2>/dev/null \
+              | sort -n -k1,1 \
+              | awk -v limit=$((LIMIT_MB * 1024 * 1024)) -v total="$((SIZE_MB * 1024 * 1024))" '
+                  { if (total <= limit) exit; total -= $2; $1=""; $2=""; sub(/^  /,""); print }
+                ' \
+              | while IFS= read -r f; do rm -f "$f"; done
+            echo "已裁剪到 $(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1) MiB"
+          fi
+
       - name: Prepare AnyKernel3
         run: |
+          set -euo pipefail
+
           git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
-          rm -rf AnyKernel3/.git
-          if [ -f "kernel_workspace/Image" ]; then
-            cp kernel_workspace/Image AnyKernel3/
-          else
-            cp kernel_workspace/bazel-bin/common/kernel_aarch64/Image AnyKernel3/
+          rm -rf ./AnyKernel3/.git ./AnyKernel3/push.sh
+
+          CANDIDATES=(
+            "kernel_workspace/bazel-bin/common/kernel_aarch64/dist/Image"
+            "kernel_workspace/bazel-bin/common/kernel_aarch64/Image"
+            "kernel_workspace/bazel-bin/common/kernel_aarch64_dist/Image"
+            "kernel_workspace/out/android16-6.12/dist/Image"
+            "kernel_workspace/out/dist/Image"
+          )
+
+          image_path=""
+          for candidate in "${CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+              image_path="$candidate"
+              echo "✅ Image: $image_path"
+              break
+            fi
+          done
+
+          if [ -z "$image_path" ]; then
+            image_path="$(find kernel_workspace \( -path "*/dist/Image" -o -path "*/kernel_aarch64/Image" -o -name "Image" \) \
+              -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
           fi
+
+          if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
+            echo "❌ 找不到内核 Image"
+            find kernel_workspace -name "Image" -type f -print 2>/dev/null | head -20 || true
+            exit 1
+          fi
+
+          cp "$image_path" ./AnyKernel3/Image
+          echo "IMAGE_SHA256=$(sha256sum ./AnyKernel3/Image | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Zip AnyKernel3
+        run: |
+          set -euo pipefail
+
+          if [ "${SUSFS_META}" = "-1" ]; then
+            SUSFS_ZIP_PART="noSUSFS"
+          else
+            SUSFS_ZIP_PART="SUSFS-${SUSVER:-unknown}"
+          fi
+
+          ZIP_NAME="AK3_ReSukiSU_${KSUVER}_${SUSFS_ZIP_PART}_${DEVICE_NAME_SAFE}_${TKERNEL_VERSION}.zip"
+          echo "📦 打包: $ZIP_NAME"
+
           cd AnyKernel3
-          zip -r9 ../OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip . -x "*.git*"
+          zip -r9 "${GITHUB_WORKSPACE}/${ZIP_NAME}" . -x "*.git*" -x "*.zip"
           cd ..
 
+          {
+            echo "ZIP_NAME=${ZIP_NAME}"
+            echo "ZIP_SIZE=$(du -h "${GITHUB_WORKSPACE}/${ZIP_NAME}" | awk '{print $1}')"
+            echo "ZIP_SHA256=$(sha256sum "${GITHUB_WORKSPACE}/${ZIP_NAME}" | awk '{print $1}')"
+          } >> "$GITHUB_ENV"
+
+          unzip -l "${GITHUB_WORKSPACE}/${ZIP_NAME}" | grep -E "(Image|anykernel\.sh)" || true
+
       - name: Upload AnyKernel3 as artifact
-         
         uses: actions/upload-artifact@v7
         with:
-          name: SukiSU_${{ env.KSUVER }}_OnePlus_Ace_6T
-          path: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
+          name: ${{ env.DEVICE_NAME_SAFE }}_ReSukiSU_${{ env.KSUVER }}_${{ env.TKERNEL_VERSION }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Create Release
-         
-        uses: softprops/action-gh-release@v2.5.0
+        if: "${{ github.event_name == 'schedule' || inputs.create_release == true }}"
+        uses: softprops/action-gh-release@v3
         with:
-          name: Release ${{ env.DATE }}
-          body: 一加平板2Pro ReSukiSU_${{ env.KSUVER }},一加 Ace 6T ReSukiSU_${{ env.KSUVER }}
+          name: Release ${{ env.DATE }} — ReSukiSU ${{ env.KSUVER }} — SUSFS ${{ env.SUSVER }}
+          body: |
+            ## 📦 ${{ env.DEVICE_NAME }} ReSukiSU 内核
+
+            | 项目 | 值 |
+            |------|-----|
+            | 设备 | ${{ env.DEVICE_NAME }} (`${{ env.DEVICE_CODENAME }}`) |
+            | 平台 | `${{ env.CPU }}` / `${{ env.KANDROID_VERSION }}` / `${{ env.TKERNEL_VERSION }}` |
+            | GKI 分支 | `common-${{ env.KERNEL_BRANCH }}` |
+            | ReSukiSU | `${{ env.KSUVER }}` (`${{ env.KSU_COMMIT_SHA }}`) |
+            | SUSFS | ${{ env.SUSVER }} — `${{ env.SUSFS_BRANCH_NAME }}` |
+            | 内核后缀 | `${{ env.KERNEL_SUFFIX_USED }}` |
+            | KPM | ❌ 已移除（ReSukiSU 上游不再支持） |
+            | ZIP SHA256 | `${{ env.ZIP_SHA256 }}` |
           tag_name: ${{ env.KSUVER }}
           prerelease: false
-          files: OnePlus_Ace_6T_ReSukiSU_${{ env.KSUVER }}.zip
+          files: ${{ env.ZIP_NAME }}
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "## 🟢 ${{ env.DEVICE_NAME }} — ReSukiSU ${{ env.KSUVER }}"
+            else
+              echo "## 🔴 ${{ env.DEVICE_NAME }} — ReSukiSU ${{ env.KSUVER }}"
+            fi
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 平台 | \`${{ env.CPU }}\` / \`${{ env.KANDROID_VERSION }}\` / \`${{ env.TKERNEL_VERSION }}\` |"
+            echo "| GKI 分支 | \`common-${{ env.KERNEL_BRANCH }}\` |"
+            echo "| ReSukiSU | \`${{ env.KSUVER }}\` (\`${{ env.KSU_COMMIT_SHA }}\`) |"
+            echo "| SUSFS | \`${{ env.SUSVER }}\` / \`${{ env.SUSFS_BRANCH_NAME }}\` |"
+            echo "| KPM | ❌ 已移除 |"
+            echo "| ZIP | \`${{ env.ZIP_NAME }}\` |"
+            echo "| Image SHA256 | \`${{ env.IMAGE_SHA256 }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
