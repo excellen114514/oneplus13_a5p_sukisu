@@ -48,6 +48,8 @@ jobs:
       CCACHE_HARDLINK: "true"
       CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: 8G
+      # 避免 git 在 CI 里卡在凭据提示上（无应答器环境会以 128 直接失败）
+      GIT_TERMINAL_PROMPT: "0"
       # 自由格式输入统一转成环境变量，避免直接拼接进脚本产生注入风险
       KSU_SETUP_BRANCH: ${{ inputs.ksu_setup_branch || 'main' }}
       KSU_META: ${{ inputs.ksu_meta || 'main/⚡Ultra⚡/' }}
@@ -435,25 +437,109 @@ jobs:
           echo "🔎 BUILD.bazel 中剩余的 protected 限制:"
           grep -n "protected" "$BUILD_FILE" || echo "（已全部移除）"
 
+      - name: Normalize GKI defconfig for Kleaf
+        run: |
+          set -euo pipefail
+
+          cd kernel_workspace
+
+          # Kleaf 会跑 savedefconfig 并断言结果与源码树里的
+          # arch/arm64/configs/gki_defconfig 完全一致（check_defconfig_minimized）。
+          # 我们手工追加的条目不是 savedefconfig 规范形式，第一次必然断言失败；
+          # 借用这次失败的产物（out/cache/*/common/defconfig 就是 savedefconfig
+          # 的输出）写回源码树，第二次即可自洽通过。
+          echo "① 第一次 kernel_aarch64_config（预期以 check_defconfig_minimized 失败）"
+          set +e
+          tools/bazel build --config=fast --lto=none --jobs="$(nproc)" \
+            //common:kernel_aarch64_config > normalize_defconfig_first.log 2>&1
+          FIRST_STATUS=$?
+          set -e
+
+          NORMALIZED="$(find out/cache -path '*/common/defconfig' -type f -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | head -1 | cut -d' ' -f2- || true)"
+
+          if [ -z "$NORMALIZED" ] || [ ! -f "$NORMALIZED" ]; then
+            echo "❌ 未能在 out/cache 下找到 normalized defconfig"
+            tail -60 normalize_defconfig_first.log || true
+            exit 1
+          fi
+
+          echo "✅ 规范化产物: $NORMALIZED"
+          cp "$NORMALIZED" common/arch/arm64/configs/gki_defconfig
+          head -1 common/arch/arm64/configs/gki_defconfig
+
+          grep -q '^CONFIG_KSU=y' common/arch/arm64/configs/gki_defconfig || {
+            echo "❌ 规范化后 CONFIG_KSU=y 丢失，终止"
+            exit 1
+          }
+
+          echo "② 第二次 kernel_aarch64_config（应通过断言）"
+          tools/bazel build --config=fast --lto=none --jobs="$(nproc)" \
+            //common:kernel_aarch64_config > normalize_defconfig_second.log 2>&1 || {
+              echo "❌ 规范化后仍不通过 check_defconfig_minimized"
+              tail -60 normalize_defconfig_second.log || true
+              exit 1
+            }
+
+          echo "✅ defconfig 已规范化（第一次退出码 ${FIRST_STATUS}，属预期）"
+
       - name: Verify important config entries
         run: |
           set -euo pipefail
 
           cd kernel_workspace/common
-          CONFIG_FILE="./arch/arm64/configs/gki_defconfig"
 
-          echo "🔎 关键 defconfig 条目:"
-          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT=' "$CONFIG_FILE" || true
+          echo "🔎 规范化后的 arch/arm64/configs/gki_defconfig:"
+          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT=' ./arch/arm64/configs/gki_defconfig || true
 
-          grep -q '^CONFIG_KSU=y' "$CONFIG_FILE" || { echo "❌ CONFIG_KSU=y 缺失"; exit 1; }
-          if grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' "$CONFIG_FILE"; then
-            echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 不应为 y"
-            exit 1
-          fi
-          if grep -q '^CONFIG_KPM=y' "$CONFIG_FILE"; then
+          grep -q '^CONFIG_KSU=y' ./arch/arm64/configs/gki_defconfig || { echo "❌ CONFIG_KSU=y 缺失"; exit 1; }
+          if grep -q '^CONFIG_KPM=y' ./arch/arm64/configs/gki_defconfig; then
             echo "❌ CONFIG_KPM=y 不应存在（KPM 支持已移除）"
             exit 1
           fi
+
+          # 以 Kleaf 实际生成的 .config 为准做最终校验：savedefconfig 会把等于
+          # Kconfig 默认值的条目省略，所以这里只断言"必须打开"的功能没有丢
+          cd ../..
+          GENERATED="$(find out/cache -name '.config' -type f -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | head -1 | cut -d' ' -f2- || true)"
+
+          if [ -z "$GENERATED" ] || [ ! -f "$GENERATED" ]; then
+            echo "⚠️ 未找到 Kleaf 生成的 .config，跳过该部分校验"
+            exit 0
+          fi
+
+          echo "🔎 Kleaf 生成的 .config ($GENERATED):"
+          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT' "$GENERATED" || true
+
+          check_on() {
+            grep -q "^$1=y" "$GENERATED" || { echo "❌ $1 在生成的 .config 中未启用"; exit 1; }
+          }
+
+          check_on CONFIG_KSU
+          check_on CONFIG_KSU_MULTI_MANAGER_SUPPORT
+
+          if [ "${SUSFS_META}" != "-1" ]; then
+            check_on CONFIG_KSU_SUSFS
+            check_on CONFIG_KSU_SUSFS_SUS_PATH
+            check_on CONFIG_KSU_SUSFS_SUS_MAP
+            check_on CONFIG_KSU_SUSFS_SUS_MOUNT
+            check_on CONFIG_KSU_SUSFS_SUS_KSTAT
+            check_on CONFIG_KSU_SUSFS_SPOOF_UNAME
+            check_on CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            check_on CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          fi
+
+          if grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' "$GENERATED"; then
+            echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 在生成的 .config 中不应为 y"
+            exit 1
+          fi
+          if grep -q '^CONFIG_KPM=y' "$GENERATED"; then
+            echo "❌ CONFIG_KPM=y 在生成的 .config 中不应存在"
+            exit 1
+          fi
+
+          echo "✅ 关键配置校验通过"
 
       - name: Commit modifications to clean tree
         run: |

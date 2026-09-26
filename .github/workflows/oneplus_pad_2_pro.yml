@@ -49,6 +49,8 @@ jobs:
       CCACHE_HARDLINK: "true"
       CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: 8G
+      # 避免 git 在 CI 里卡在凭据提示上（无应答器环境会以 128 直接失败）
+      GIT_TERMINAL_PROMPT: "0"
       # 自由格式输入统一转成环境变量，避免直接拼接进脚本产生注入风险
       KSU_SETUP_BRANCH: ${{ inputs.ksu_setup_branch || 'main' }}
       KSU_META: ${{ inputs.ksu_meta || 'main/⚡Ultra⚡/' }}
@@ -464,7 +466,9 @@ jobs:
 
           export KBUILD_BUILD_TIMESTAMP="$(TZ='UTC' date +'%a %b %d %T %Z %Y')"
           export KBUILD_BUILD_VERSION=1
-          export LOCALVERSION="${KERNEL_SUFFIX}"
+          # 不要再 export LOCALVERSION：setlocalversion 会同时拼接
+          # ${config_localversion} 与 ${LOCALVERSION}，而 defconfig 里已经写了
+          # CONFIG_LOCALVERSION="${KERNEL_SUFFIX}"，两者同时存在会让后缀重复两遍
           export PATH="$PWD/prebuilts/clang/host/linux-x86/clang-r510928/bin:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
 
@@ -475,6 +479,9 @@ jobs:
             LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS_PERF+=-O3 \
             gki_defconfig all
 
+          echo "🏷️ 内核版本字符串:"
+          cat out/include/config/kernel.release 2>/dev/null || true
+
       - name: Prepare AnyKernel3
         run: |
           set -euo pipefail
@@ -482,7 +489,21 @@ jobs:
           IMAGE="kernel_workspace/kernel_platform/common/out/arch/arm64/boot/Image"
           [ -f "$IMAGE" ] || { echo "❌ 找不到内核 Image"; exit 1; }
 
-          git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
+          # 公开仓库不需要凭据；显式清掉用户级 git 配置，避免继承到
+          # 与仓库不匹配的 credential.helper（曾导致 "could not read Username" 128）
+          for attempt in 1 2 3; do
+            rm -rf ./AnyKernel3
+            if git -c credential.helper= -c core.askPass= \
+                 clone --depth=1 --config credential.helper= \
+                 https://github.com/Kernel-SU/AnyKernel3.git ./AnyKernel3; then
+              break
+            fi
+            echo "⚠️ AnyKernel3 拉取失败（第 ${attempt} 次），10s 后重试"
+            sleep 10
+          done
+
+          [ -f ./AnyKernel3/anykernel.sh ] || { echo "❌ AnyKernel3 拉取失败"; exit 1; }
+
           rm -rf ./AnyKernel3/.git ./AnyKernel3/push.sh
           cp "$IMAGE" ./AnyKernel3/Image
 
