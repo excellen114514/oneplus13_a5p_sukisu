@@ -27,3 +27,17 @@
 14.添加BBR算法
 -2025-6.18-14:30
 15.更新一加ace5至尊版编译
+16.跟随 ReSukiSU 上游移除 KPM（KernelPatch）支持：删除 enable_feature_x 开关、
+   删除 CONFIG_KPM=y 与 patch_linux 二次修补 Image 的步骤，defconfig 显式写入 CONFIG_KPM=n
+17.更新 ReSukiSU 集成：官方 setup.sh + 软链/Makefile/Kconfig 接入校验，
+   新增 CONFIG_KSU_MULTI_MANAGER_SUPPORT=y、CONFIG_KSU_FULL_NAME_FORMAT 与
+   CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=n（GKI 符号裁剪会导致 unresolved symbol）
+18.SUSFS 改为先 dry-run 再应用，自动探测上游版本号；SUSFS_META 支持版本回滚(-1 为禁用)
+19.一加平板2Pro 清理已不存在的 SUSFS 旧配置项(SUS_SU/HAS_MAGIC_MOUNT/TRY_UMOUNT/
+   AUTO_ADD_*/SUS_OVERLAYFS)，并显式给出 SUSFS 各子项开关
+20.Ace 6T 内核后缀默认对齐该 GKI 发行版原厂 uname -r，构建系统改用 bazel 磁盘缓存加速
+21.动作版本更新：actions/cache@v6、actions/upload-artifact@v7、
+   softprops/action-gh-release@v3，运行环境 ubuntu-24.04
+22.新增关键 defconfig 条目校验、Job Summary 与统一产物命名
+   AK3_ReSukiSU_<KSUVER>_<SUSFS版本|noSUSFS>_<设备>_<内核版本>.zip
+-2026-09-26
