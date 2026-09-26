@@ -422,6 +422,20 @@ jobs:
 
           echo "🏷️ 内核后缀: ${SUFFIX}"
 
+      - name: Commit modifications to clean tree
+        run: |
+          set -euo pipefail
+
+          cd kernel_workspace/common
+          git add -A
+          git commit -m "Apply ReSukiSU, SUSFS and config changes" || true
+
+          # 必须在 config 目标之前提交：setlocalversion 的 scm_version 一旦发现树是脏的
+          # 就会在 -dirty 被替换掉之后补一个 "+"，导致 uname -r 变成
+          # 6.12.38-...-4k+ 这种尾巴
+          git status --porcelain | head -20 || true
+          echo "✅ 已提交，工作树状态如上（应为空）"
+
       - name: Modules configuration (kernel 6.12)
         run: |
           set -euo pipefail
@@ -466,12 +480,16 @@ jobs:
 
           echo "✅ 规范化产物: $NORMALIZED"
           cp "$NORMALIZED" common/arch/arm64/configs/gki_defconfig
-          head -1 common/arch/arm64/configs/gki_defconfig
 
-          grep -q '^CONFIG_KSU=y' common/arch/arm64/configs/gki_defconfig || {
-            echo "❌ 规范化后 CONFIG_KSU=y 丢失，终止"
-            exit 1
-          }
+          LINES="$(wc -l < common/arch/arm64/configs/gki_defconfig)"
+          echo "📄 规范化后行数: ${LINES}，首行: $(head -1 common/arch/arm64/configs/gki_defconfig)"
+          [ "$LINES" -gt 100 ] || { echo "❌ 规范化产物行数异常，疑似不是完整的 defconfig"; exit 1; }
+
+          # 注意：savedefconfig 会把「值等于 Kconfig 默认值」的条目整条删掉。
+          # CONFIG_KSU 在 ReSukiSU 的 Kconfig 里是 default y，所以我们显式写的
+          # CONFIG_KSU=y 会被它删掉——这是正常的，不代表功能丢失。
+          # 真正需要断言的是 Kleaf 最终生成的 .config（见下一步），那里才是
+          # olddefconfig 求解后的结果。
 
           echo "② 第二次 kernel_aarch64_config（应通过断言）"
           tools/bazel build --config=fast --lto=none --jobs="$(nproc)" \
@@ -492,61 +510,14 @@ jobs:
           echo "🔎 规范化后的 arch/arm64/configs/gki_defconfig:"
           grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT=' ./arch/arm64/configs/gki_defconfig || true
 
-          grep -q '^CONFIG_KSU=y' ./arch/arm64/configs/gki_defconfig || { echo "❌ CONFIG_KSU=y 缺失"; exit 1; }
+          grep -q '^CONFIG_KSU=y' ./arch/arm64/configs/gki_defconfig \
+            || echo "ℹ️ CONFIG_KSU 未出现在规范化后的 defconfig（default y 会被 savedefconfig 省略，属正常）"
           if grep -q '^CONFIG_KPM=y' ./arch/arm64/configs/gki_defconfig; then
             echo "❌ CONFIG_KPM=y 不应存在（KPM 支持已移除）"
             exit 1
           fi
 
-          # 以 Kleaf 实际生成的 .config 为准做最终校验：savedefconfig 会把等于
-          # Kconfig 默认值的条目省略，所以这里只断言"必须打开"的功能没有丢
-          cd ../..
-          GENERATED="$(find out/cache -name '.config' -type f -printf '%T@ %p\n' 2>/dev/null \
-            | sort -rn | head -1 | cut -d' ' -f2- || true)"
-
-          if [ -z "$GENERATED" ] || [ ! -f "$GENERATED" ]; then
-            echo "⚠️ 未找到 Kleaf 生成的 .config，跳过该部分校验"
-            exit 0
-          fi
-
-          echo "🔎 Kleaf 生成的 .config ($GENERATED):"
-          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT' "$GENERATED" || true
-
-          check_on() {
-            grep -q "^$1=y" "$GENERATED" || { echo "❌ $1 在生成的 .config 中未启用"; exit 1; }
-          }
-
-          check_on CONFIG_KSU
-          check_on CONFIG_KSU_MULTI_MANAGER_SUPPORT
-
-          if [ "${SUSFS_META}" != "-1" ]; then
-            check_on CONFIG_KSU_SUSFS
-            check_on CONFIG_KSU_SUSFS_SUS_PATH
-            check_on CONFIG_KSU_SUSFS_SUS_MAP
-            check_on CONFIG_KSU_SUSFS_SUS_MOUNT
-            check_on CONFIG_KSU_SUSFS_SUS_KSTAT
-            check_on CONFIG_KSU_SUSFS_SPOOF_UNAME
-            check_on CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-            check_on CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          fi
-
-          if grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' "$GENERATED"; then
-            echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 在生成的 .config 中不应为 y"
-            exit 1
-          fi
-          if grep -q '^CONFIG_KPM=y' "$GENERATED"; then
-            echo "❌ CONFIG_KPM=y 在生成的 .config 中不应存在"
-            exit 1
-          fi
-
-          echo "✅ 关键配置校验通过"
-
-      - name: Commit modifications to clean tree
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/common
-          git add -A
-          git commit -m "Apply ReSukiSU, SUSFS and config changes" || true
+          echo "ℹ️ 配置可用性的权威校验放在编译完成之后的 \"Verify generated config\" 步骤"
 
       - name: Set build timestamp
         run: |
@@ -590,6 +561,67 @@ jobs:
 
           echo "✅ 编译完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
+      - name: Verify generated config
+        run: |
+          set -euo pipefail
+
+          cd kernel_workspace
+
+          # 这是权威校验：Kleaf 编译过程中真正求解出来的 .config
+          GENERATED="$(find out/cache -name '.config' -type f -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | head -1 | cut -d' ' -f2- || true)"
+
+          if [ -z "$GENERATED" ] || [ ! -f "$GENERATED" ]; then
+            echo "⚠️ 未在 out/cache 下找到 .config，改用 include/generated/autoconf.h 兜底校验"
+            AUTOCONF="$(find out/cache -name 'autoconf.h' -path '*include/generated*' -type f -printf '%T@ %p\n' 2>/dev/null \
+              | sort -rn | head -1 | cut -d' ' -f2- || true)"
+            [ -n "$AUTOCONF" ] && [ -f "$AUTOCONF" ] || { echo "❌ 找不到任何编译配置产物"; exit 1; }
+            echo "🔎 $AUTOCONF"
+            for sym in CONFIG_KSU CONFIG_KSU_MULTI_MANAGER_SUPPORT CONFIG_KSU_SUSFS \
+                       CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MAP CONFIG_KSU_SUSFS_SUS_MOUNT \
+                       CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SPOOF_UNAME \
+                       CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+              grep -qE "^#define ${sym} 1$" "$AUTOCONF" || { echo "❌ ${sym} 未启用"; exit 1; }
+            done
+            grep -qE '^#define CONFIG_KPM 1$' "$AUTOCONF" && { echo "❌ CONFIG_KPM 被启用"; exit 1; }
+            grep -qE '^#define CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 1$' "$AUTOCONF" \
+              && { echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 被启用"; exit 1; }
+            echo "✅ 关键配置校验通过（autoconf.h）"
+            exit 0
+          fi
+
+          echo "🔎 Kleaf 生成的 .config: $GENERATED"
+          grep -nE 'CONFIG_KSU=|CONFIG_KSU_MULTI_MANAGER_SUPPORT=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS|CONFIG_KPM=|CONFIG_TCP_CONG_BBR=|CONFIG_KSU_FULL_NAME_FORMAT' "$GENERATED" || true
+
+          check_on() {
+            grep -q "^$1=y" "$GENERATED" || { echo "❌ $1 在生成的 .config 中未启用"; exit 1; }
+          }
+
+          check_on CONFIG_KSU
+          check_on CONFIG_KSU_MULTI_MANAGER_SUPPORT
+
+          if [ "${SUSFS_META}" != "-1" ]; then
+            check_on CONFIG_KSU_SUSFS
+            check_on CONFIG_KSU_SUSFS_SUS_PATH
+            check_on CONFIG_KSU_SUSFS_SUS_MAP
+            check_on CONFIG_KSU_SUSFS_SUS_MOUNT
+            check_on CONFIG_KSU_SUSFS_SUS_KSTAT
+            check_on CONFIG_KSU_SUSFS_SPOOF_UNAME
+            check_on CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            check_on CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          fi
+
+          if grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' "$GENERATED"; then
+            echo "❌ CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS 在生成的 .config 中不应为 y"
+            exit 1
+          fi
+          if grep -q '^CONFIG_KPM=y' "$GENERATED"; then
+            echo "❌ CONFIG_KPM=y 在生成的 .config 中不应存在"
+            exit 1
+          fi
+
+          echo "✅ 关键配置校验通过"
+
       - name: Trim Bazel disk cache
         if: always()
         run: |
@@ -615,8 +647,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          git clone https://github.com/Kernel-SU/AnyKernel3.git --depth=1
+          # 优先走 codeload tarball：不需要 git 凭据，行为最确定
+          AK3_URL="https://codeload.github.com/Kernel-SU/AnyKernel3/tar.gz/refs/heads/master"
+
+          fetch_ak3() {
+            rm -rf ./AnyKernel3
+            mkdir -p ./AnyKernel3
+            if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+                 -o /tmp/ak3.tar.gz "$AK3_URL" \
+               && tar -xzf /tmp/ak3.tar.gz -C ./AnyKernel3 --strip-components=1 \
+               && [ -f ./AnyKernel3/anykernel.sh ]; then
+              return 0
+            fi
+            # 回退：普通 git clone（保留环境自带的 credential helper）
+            rm -rf ./AnyKernel3
+            git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git ./AnyKernel3 \
+              && [ -f ./AnyKernel3/anykernel.sh ]
+          }
+
+          ok=0
+          for attempt in 1 2 3; do
+            if fetch_ak3; then ok=1; break; fi
+            echo "⚠️ AnyKernel3 获取失败（第 ${attempt} 次），10s 后重试"
+            sleep 10
+          done
+          [ "$ok" = "1" ] || { echo "❌ AnyKernel3 获取失败"; exit 1; }
+
           rm -rf ./AnyKernel3/.git ./AnyKernel3/push.sh
+          ls -la ./AnyKernel3 | head -20
 
           CANDIDATES=(
             "kernel_workspace/bazel-bin/common/kernel_aarch64/dist/Image"
