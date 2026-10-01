@@ -647,32 +647,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 原 Kernel-SU/AnyKernel3 已不可用，改用 osm0sis/AnyKernel3
-          AK3_URL="https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master"
+          # 使用 Bouteillepleine/AnyKernel3，分支 gki-2.0
+          AK3_REPO="https://github.com/Bouteillepleine/AnyKernel3"
+          AK3_BRANCH="gki-2.0"
 
-          fetch_ak3() {
-            rm -rf ./AnyKernel3
-            mkdir -p ./AnyKernel3
-            if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-                 -o /tmp/ak3.tar.gz "$AK3_URL" \
-               && tar -xzf /tmp/ak3.tar.gz -C ./AnyKernel3 --strip-components=1 \
-               && [ -f ./AnyKernel3/anykernel.sh ]; then
-              return 0
-            fi
-            rm -rf ./AnyKernel3
-            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ./AnyKernel3 \
-              && [ -f ./AnyKernel3/anykernel.sh ]
-          }
+          rm -rf ./AnyKernel3
+          git clone --depth=1 -b "$AK3_BRANCH" "$AK3_REPO" ./AnyKernel3
 
-          ok=0
-          for attempt in 1 2 3; do
-            if fetch_ak3; then ok=1; break; fi
-            echo "⚠️ AnyKernel3 获取失败（第 ${attempt} 次），10s 后重试"
-            sleep 10
-          done
-          [ "$ok" = "1" ] || { echo "❌ AnyKernel3 获取失败"; exit 1; }
+          [ -f ./AnyKernel3/anykernel.sh ] || { echo "❌ AnyKernel3 获取失败：缺少 anykernel.sh"; exit 1; }
 
-          rm -rf ./AnyKernel3/.git ./AnyKernel3/push.sh
+          rm -rf ./AnyKernel3/.git
           ls -la ./AnyKernel3 | head -20
 
           CANDIDATES=(
