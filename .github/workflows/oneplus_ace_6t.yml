@@ -647,8 +647,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 优先走 codeload tarball：不需要 git 凭据，行为最确定
-          AK3_URL="https://codeload.github.com/Kernel-SU/AnyKernel3/tar.gz/refs/heads/master"
+          # 原 Kernel-SU/AnyKernel3 已不可用，改用 osm0sis/AnyKernel3
+          AK3_URL="https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master"
 
           fetch_ak3() {
             rm -rf ./AnyKernel3
@@ -659,9 +659,8 @@ jobs:
                && [ -f ./AnyKernel3/anykernel.sh ]; then
               return 0
             fi
-            # 回退：普通 git clone（保留环境自带的 credential helper）
             rm -rf ./AnyKernel3
-            git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git ./AnyKernel3 \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ./AnyKernel3 \
               && [ -f ./AnyKernel3/anykernel.sh ]
           }
 

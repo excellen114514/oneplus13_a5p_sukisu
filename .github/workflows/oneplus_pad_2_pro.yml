@@ -423,6 +423,11 @@ jobs:
           force_config "CONFIG_LOCALVERSION=\"${KERNEL_SUFFIX}\""
           force_config "CONFIG_LOCALVERSION_AUTO=n"
 
+          # 防止 setlocalversion 在 git 树 dirty 时追加 '+'，导致内核版本变成 6.6.57-Elaina-ExceSama+
+          if [ -f ./common/scripts/setlocalversion ]; then
+            sed -i 's/echo "+"/:/g; s/echo +/:/g' ./common/scripts/setlocalversion || true
+          fi
+
           # 移除 check_defconfig 避免 defconfig 一致性检查失败
           sed -i 's/check_defconfig//' ./common/build.config.gki || true
 
@@ -489,11 +494,8 @@ jobs:
           IMAGE="kernel_workspace/kernel_platform/common/out/arch/arm64/boot/Image"
           [ -f "$IMAGE" ] || { echo "❌ 找不到内核 Image"; exit 1; }
 
-          # 公开仓库不需要凭据；优先用 codeload tarball（不涉及 git 认证），
-          # 失败再回退到普通 git clone（保留环境自带的 credential helper）。
-          # 上一版把 credential.helper 清空反而强制了匿名访问，GitHub 回 401 ->
-          # "could not read Username ... terminal prompts disabled"，故不再覆盖。
-          AK3_URL="https://codeload.github.com/Kernel-SU/AnyKernel3/tar.gz/refs/heads/master"
+          # 原 Kernel-SU/AnyKernel3 已不可用，改用 osm0sis/AnyKernel3
+          AK3_URL="https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master"
 
           fetch_ak3() {
             rm -rf ./AnyKernel3
@@ -504,9 +506,8 @@ jobs:
                && [ -f ./AnyKernel3/anykernel.sh ]; then
               return 0
             fi
-            # 回退：普通 git clone（保留环境自带的 credential helper）
             rm -rf ./AnyKernel3
-            git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git ./AnyKernel3 \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ./AnyKernel3 \
               && [ -f ./AnyKernel3/anykernel.sh ]
           }
 
