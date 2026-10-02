@@ -315,22 +315,44 @@ jobs:
 
           # 3. 把原本“未使用”的保留槽位改写成承载 sysvsem / sysvshm
           #    用 % 拼接而非 f-string：f-string 表达式里不能出现反斜杠（\t 会语法错误）
+          #
+          #    ⚠️ 槽位数必须匹配结构体大小，这是本次 CI 报错的根因：
+          #    include/linux/android_kabi.h 里
+          #        #define _ANDROID_KABI_REPLACE(_orig, _new) \
+          #            __ANDROID_KABI_CHECK_SIZE_ALIGN(_orig, _new); _new
+          #        _Static_assert(sizeof(struct{_new;}) <= sizeof(struct{_orig;}), ...)
+          #    _orig 是可变参数，多个槽位会用分号拼进同一个匿名 struct，尺寸相加。
+          #    在 arm64 上 sizeof(u64) == 8：
+          #        struct sysv_sem == 8  → 1 个槽位即可
+          #        struct sysv_shm == 16 → 必须占 2 个连续槽位
+          #    只给 1 个槽位就会得到
+          #        "struct sysv_shm sysvshm is larger than u64 android_kabi_reserved2"
+          #        且 expression evaluates to '16 <= 8'
+          #    （验证：sizeof(struct{ANDROID_KABI_RESERVE(2);ANDROID_KABI_RESERVE(3);})
+          #      == 16，正好容纳 sysvshm。）
           use_tpl = "ANDROID_KABI_USE(%s, struct sysv_sem sysvsem);"
-          repl_tpl = ("_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(%s), "
-                      "struct sysv_shm sysvshm);")
-          new_frag = {0: use_tpl % s1, 1: repl_tpl % s2, 2: ""}
+          repl_tpl = ("_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(%s); "
+                      "ANDROID_KABI_RESERVE(%s), struct sysv_shm sysvshm);")
+          repl_frag = repl_tpl % (s2, s3)
+          new_frag = {0: use_tpl % s1, 1: repl_frag, 2: ""}
 
           # 从后往前替换，避免前面的改动导致后面的下标位移
           for idx in sorted(range(3), key=lambda i: targets[i].start(), reverse=True):
               m = targets[idx]
-              text = text[: m.start()] + m.group(1) + new_frag[idx] + text[m.end():]
+              line = m.group(1) + new_frag[idx]
+              # 被 sysvshm 合并占用的 s3 槽位整行删除：不能留下只有缩进的空白行，
+              # 否则 git diff / patch 里会多出带尾随空格的改动行
+              if not line.strip():
+                  text = text[: m.start()] + text[m.end():]
+              else:
+                  text = text[: m.start()] + line + text[m.end():]
 
           # 成员声明必须已从中部彻底消失（逐行复查，不依赖具体缩进）
           if any(member_re.match(ln) for ln in text.split("\n")):
               print("ERROR:中部仍残留 sysv 成员声明")
               raise SystemExit(1)
 
-          for frag in (use_tpl % s1, repl_tpl % s2):
+          for frag in (use_tpl % s1, repl_frag):
               if text.count(frag) != 1:
                   print(f"ERROR:改写后 {frag!r} 出现 {text.count(frag)} 次，期望 1 次")
                   raise SystemExit(1)
