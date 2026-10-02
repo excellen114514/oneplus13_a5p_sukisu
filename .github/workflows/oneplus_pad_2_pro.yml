@@ -25,20 +25,44 @@ on:
         default: true
         type: boolean
       container_mode:
-        description: "🐳 容器/Docker 支持: 0=关闭 | 1=kABI padding 槽位 1/2/3 | 2=槽位 6/7/8 | 3=槽位 3/4/5"
+        description: "🐳 容器/Docker: 4=安全模式(推荐,不碰task_struct) | 0=关闭 | 1/2/3=开SYSVIPC+kABI槽位组合(卡第一屏就换下一个)"
         required: true
-        default: "1"
+        default: "4"
         type: choice
         options:
+          - "4"
+          - "0"
           - "1"
           - "2"
           - "3"
-          - "0"
-      cgroup_device_controller:
-        description: "🧩 开启 cgroup v1 devices 控制器（Docker 必需；若卡开机/无法启动请改为 false 重新构建）"
+      container_ipc_ns:
+        description: "🧱 开启 IPC namespace（Docker 必需；走 POSIX_MQUEUE，不碰 task_struct，无卡开机风险）"
         required: true
         default: true
         type: boolean
+      cgroup_device_controller:
+        description: "🧩 cgroup v1 devices 控制器 — ⚠️ 一加机型卡开机元凶，默认关闭；仅 Docker 设备白名单需要"
+        required: true
+        default: false
+        type: boolean
+      risky_container_extras:
+        description: "⚠️ 其余高风险项（kABI 补丁/SYSVIPC/PID_NS/FHANDLE/diag）— 仅在 minimal 已能开机时才开"
+        required: true
+        default: false
+        type: boolean
+        # ⚠️ 与 container_mode 的联动：本开关为 false 时，即使把 container_mode 设成
+        #    1/2/3，kABI 补丁与 CONFIG_SYSVIPC 也都不会执行（见两处 if 条件）。
+        #    想验证 SysV IPC / kABI 槽位时，必须同时把本项改成 true，否则会
+        #    "改了 container_mode 但行为没变"，白白浪费一次构建。
+      container_level:
+        description: "🧪 容器配置档位: minimal=仅公认安全项(先验证能否开机) | standard=+可选安全项 | full=全部"
+        required: true
+        default: "minimal"
+        type: choice
+        options:
+          - minimal
+          - standard
+          - full
       create_release:
         description: "📤 发布 GitHub Release"
         required: true
@@ -70,11 +94,19 @@ jobs:
       KSU_SETUP_BRANCH: ${{ inputs.ksu_setup_branch || 'main' }}
       KSU_META: ${{ inputs.ksu_meta || 'main/⚡Ultra⚡/' }}
       SUSFS_META: ${{ inputs.susfs_meta }}
-      # 容器/Docker 支持。container_mode: 0=关闭; 1/2/3 = 使用不同的 task_struct
-      # kABI padding 槽位组合。同一机型不同系统版本，厂商预编译模块占用的槽位不同，
-      # 若刷入后卡开机/黑屏，请换下一个编号重新构建（1 -> 2 -> 3）。
-      CONTAINER_MODE: ${{ inputs.container_mode || '1' }}
+      # 容器/Docker 支持。container_mode:
+      #   4 = 安全模式（推荐）：完全不碰 struct task_struct —— 不开 SYSVIPC、
+      #       不打 kABI 补丁，改用 POSIX_MQUEUE 满足 IPC_NS 的依赖。
+      #       ⇒ 排除掉"卡第一屏"的头号原因，同时仍然拿到 Docker 必需的 IPC namespace。
+      #   0 = 完全不加容器配置（基线对照用）
+      #   1/2/3 = 开启 SYSVIPC 并用对应的 kABI padding 槽位组合承接 sysvsem/sysvshm。
+      #       厂商预编译模块占用的槽位随系统版本变化，卡第一屏就换下一个（2 → 3）。
+      #       1 = 槽位 1 + (2;3)，2 = 槽位 6 + (7;8)，3 = 槽位 3 + (4;5)
+      CONTAINER_MODE: ${{ inputs.container_mode || '4' }}
+      CONTAINER_LEVEL: ${{ inputs.container_level || 'minimal' }}
+      CONTAINER_IPC_NS: ${{ inputs.container_ipc_ns == false && 'false' || 'true' }}
       CGROUP_DEVICE_CONTROLLER: ${{ inputs.cgroup_device_controller == false && 'false' || 'true' }}
+      RISKY_CONTAINER_EXTRAS: ${{ inputs.risky_container_extras == false && 'false' || 'true' }}
       DEVICE_ID: "pad2pro"
       DEVICE_NAME: "OnePlus Pad 2 Pro"
       DEVICE_NAME_SAFE: "OnePlusPad2Pro"
@@ -189,7 +221,10 @@ jobs:
           echo "✅ ReSukiSU ${KSU_BRANCH} @ ${KSU_COMMIT_SHA} -> ${KSU_VERSION}"
 
       - name: Container support — kABI-safe SYSVIPC patch
-        if: ${{ env.CONTAINER_MODE != '0' }}
+        # 只有真的要开 CONFIG_SYSVIPC 时才改 sched.h，即 CONTAINER_MODE 为 1/2/3。
+        # CONTAINER_MODE=4（安全模式）与 0 都完全不碰 task_struct，
+        # 把"改了核心结构体"这个变量从排查中彻底移除。
+        if: ${{ env.CONTAINER_MODE != '0' && env.CONTAINER_MODE != '4' && env.RISKY_CONTAINER_EXTRAS == 'true' }}
         run: |
           set -euo pipefail
 
@@ -197,20 +232,23 @@ jobs:
           SCHED="$COMMON/include/linux/sched.h"
           [ -f "$SCHED" ] || { echo "❌ 找不到 $SCHED"; exit 1; }
 
-          # 为什么必须打这个补丁：
+          # 为什么必须打这个补丁（仅在 RISKY_CONTAINER_EXTRAS=true、即真的要开 SYSVIPC 时）：
           #   Docker/LXC 要求 CONFIG_IPC_NS=y，而 IPC_NS 依赖 SYSVIPC 或 POSIX_MQUEUE。
           #   直接开 CONFIG_SYSVIPC 会让 task_struct 新增 sysvsem/sysvshm 两个成员，
           #   把其后所有字段的偏移量顶掉 → 与厂商预编译模块(kgsl/相机/显示等)的 kABI
           #   不再匹配 → 模块加载失败 / 内核崩溃 → 卡开机。
           #   本补丁把这两个成员搬进 struct task_struct 末尾 Android 预留的 kABI
-          #   padding 槽位，字段偏移量保持不变，因此可以安全开启。
+          #   padding 槽位，字段偏移量保持不变。
           #   思路与 Droidspaces 项目 (ravindu644/Droidspaces-OSS) 的 GKI kABI 修补一致，
           #   这里内联实现，不依赖外部补丁文件能否按上下文应用成功。
+          #   ⚠️ 这仍是一次性地改动核心结构体，属于"卡第一屏"的可疑对象，
+          #      因此默认不执行；要开时请把它当成独立的一次二分实验。
           case "${CONTAINER_MODE}" in
             1) KABI_SLOTS=(1 2 3) ;;
             2) KABI_SLOTS=(6 7 8) ;;
             3) KABI_SLOTS=(3 4 5) ;;
-            *) echo "❌ 未知 CONTAINER_MODE=${CONTAINER_MODE}（应为 0/1/2/3）"; exit 1 ;;
+            4) echo "❌ CONTAINER_MODE=4 是安全模式：不应执行 kABI 补丁（请检查步骤 if 条件）"; exit 1 ;;
+            *) echo "❌ 未知 CONTAINER_MODE=${CONTAINER_MODE}（应为 0/1/2/3/4）"; exit 1 ;;
           esac
 
           python3 - "$SCHED" "${KABI_SLOTS[0]}" "${KABI_SLOTS[1]}" "${KABI_SLOTS[2]}" <<'PY'
@@ -336,16 +374,27 @@ jobs:
           repl_frag = repl_tpl % (s2, s3)
           new_frag = {0: use_tpl % s1, 1: repl_frag, 2: ""}
 
-          # 从后往前替换，避免前面的改动导致后面的下标位移
-          for idx in sorted(range(3), key=lambda i: targets[i].start(), reverse=True):
-              m = targets[idx]
-              line = m.group(1) + new_frag[idx]
-              # 被 sysvshm 合并占用的 s3 槽位整行删除：不能留下只有缩进的空白行，
-              # 否则 git diff / patch 里会多出带尾随空格的改动行
-              if not line.strip():
-                  text = text[: m.start()] + text[m.end():]
+          # 用「按行重建」而不是「按字符区间拼接」：
+          #   槽位正则的 $ 锚点停在行尾换行符之前，所以 m.end() 指向 "\n" 前面。
+          #   若用 text[:m.start()] + text[m.end():] 删行，被删行会退化成空字符串元素，
+          #   经 .split("\n") / "\n".join() 往返后就被还原成一行真正的空行
+          #   —— task_struct 里凭空多一个空行（变体 2 的槽位 8 恰好是最后一个
+          #   ANDROID_KABI_RESERVE，后面紧跟空行，于是出现连续两个空行）。
+          #   改成"新片段为空则整行丢弃"，问题从根上消失。
+          as_lines = text.split("\n")
+          drop_lines = set()
+          for idx in range(3):
+              _m = targets[idx]
+              _li = text.count("\n", 0, _m.start())   # 该匹配所在的行号
+              line = _m.group(1) + new_frag[idx]      # 保留原缩进
+              if line.strip():
+                  as_lines[_li] = line                # 原位替换
               else:
-                  text = text[: m.start()] + line + text[m.end():]
+                  drop_lines.add(_li)                 # 只剩空白 → 整行删除
+          if drop_lines:
+              text = "\n".join(ln for i, ln in enumerate(as_lines) if i not in drop_lines)
+          else:
+              text = "\n".join(as_lines)
 
           # 成员声明必须已从中部彻底消失（逐行复查，不依赖具体缩进）
           if any(member_re.match(ln) for ln in text.split("\n")):
@@ -804,24 +853,27 @@ jobs:
           #   * CONFIG_USER_NS 用于 rootless/非特权容器，并消除 "unsafe procfs" 报错。
           #   * OVERLAY_FS / VETH / BRIDGE / NF_NAT / MASQUERADE 分别对应 overlay2
           #     存储驱动、docker0 网桥、容器出网 NAT。
+          # 特别说明（分档位的原因）：
+          #   下面 <基础块> 是社区长期验证过、公认安全的容器配置，默认就开。
+          #   <可选块> 里的项要么改 task_struct 布局（kABI），要么改开机路径行为，
+          #   是「卡第一屏」的可疑对象，因此默认**不开**，由开关/档位逐项放行。
+          #     基础块：namespace 基础、cgroup 基础、OVERLAY_FS、
+          #             VETH/BRIDGE/DUMMY、IPv4 NAT/MASQUERADE、SECCOMP_FILTER
+          #     可选块：SYSVIPC(kABI) POSIX_MQUEUE IPC_NS PID_NS CGROUP_DEVICE
+          #             macvlan ipvlan IPv6 NAT 族 nf_tables FHANDLE diag 族
           if [ "${CONTAINER_MODE}" != "0" ]; then
-            echo "# === Container / Docker support (kABI slots ${CONTAINER_MODE}) ===" >> "$CONFIG"
-
-            # --- IPC 机制（IPC_NS 的前置依赖）---
-            ensure_config "CONFIG_SYSVIPC=y"
-            ensure_config "CONFIG_POSIX_MQUEUE=y"
+            echo "# === Container / Docker support (level=${CONTAINER_LEVEL}) ===" >> "$CONFIG"
 
             # --- 命名空间 ---
             # NAMESPACES / UTS_NS / NET_NS 在 stock defconfig 里已开启，这里只做兜底
             ensure_config "CONFIG_NAMESPACES=y"
             ensure_config "CONFIG_UTS_NS=y"
-            ensure_config "CONFIG_IPC_NS=y"
-            ensure_config "CONFIG_PID_NS=y"
             ensure_config "CONFIG_NET_NS=y"
+            # USER_NS 用于 rootless/非特权容器，并消除 "unsafe procfs" 报错
             ensure_config "CONFIG_USER_NS=y"
-            # Cgroup namespace 在部分 OnePlus 机型上会引发开机异常，默认不动，
-            # 需要时由用户显式打开（见 workflow 末尾说明）
+            # Cgroup namespace 在部分 OnePlus 机型上会引发开机异常，默认不动
             echo "  ℹ️  CONFIG_CGROUP_NS 保持 stock 状态（避免卡开机）"
+            # IPC_NS / PID_NS 见下方可选块（有依赖与开机风险）
 
             # --- cgroup 控制器 ---
             ensure_config "CONFIG_CGROUPS=y"
@@ -833,10 +885,16 @@ jobs:
             ensure_config "CONFIG_CPUSETS=y"
             ensure_config "CONFIG_BLK_CGROUP=y"
             ensure_config "CONFIG_CGROUP_CPUACCT=y"
+
+            # ⚠️ 最高风险项，单独一档：
+            #    一加/OPPO 设备上「开启 Device controller 后无法开机」是有据可查的，
+            #    AOSP GKI 也刻意不默认开它。Docker 只靠它做设备白名单，
+            #    缺了可以用 --privileged 或自定义 device cgroup 规则绕过，
+            #    因此默认关闭，确认能开机后再单独打开验证。
             if [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ]; then
               ensure_config "CONFIG_CGROUP_DEVICE=y"
             else
-              echo "  ⚠️  按输入要求跳过 CONFIG_CGROUP_DEVICE（Docker 的设备白名单将不可用）"
+              echo "  ⏭️  跳过 CONFIG_CGROUP_DEVICE（默认关闭；需要设备白名单时再开）"
             fi
 
             # --- 存储驱动 overlay2 ---
@@ -846,12 +904,10 @@ jobs:
             ensure_config "CONFIG_TMPFS_POSIX_ACL=y"
             ensure_config "CONFIG_DEVTMPFS=y"
 
-            # --- 容器网络：网桥 / veth / macvlan ---
+            # --- 容器网络：网桥 / veth（Docker 默认 bridge 网络的必备项）---
             ensure_config "CONFIG_VETH=y"
             ensure_config "CONFIG_BRIDGE=y"
             ensure_config "CONFIG_BRIDGE_NETFILTER=y"
-            ensure_config "CONFIG_MACVLAN=y"
-            ensure_config "CONFIG_IPVLAN=y"
             ensure_config "CONFIG_DUMMY=y"
 
             # --- netfilter / iptables：NAT、端口映射、连接跟踪 ---
@@ -859,49 +915,110 @@ jobs:
             ensure_config "CONFIG_NETFILTER_ADVANCED=y"
             ensure_config "CONFIG_NF_CONNTRACK=y"
             ensure_config "CONFIG_NF_NAT=y"
-            ensure_config "CONFIG_NF_TABLES=y"
             ensure_config "CONFIG_NETFILTER_XTABLES=y"
             ensure_config "CONFIG_NETFILTER_XT_MATCH_COMMENT=y"
             ensure_config "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
             ensure_config "CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y"
             ensure_config "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y"
-            ensure_config "CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y"
             ensure_config "CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y"
             ensure_config "CONFIG_NETFILTER_XT_NAT=y"
 
-            # 容器出网 / 端口发布（IPv4 + IPv6）
+            # 容器出网 / 端口发布（IPv4）
             ensure_config "CONFIG_IP_NF_IPTABLES=y"
             ensure_config "CONFIG_IP_NF_FILTER=y"
             ensure_config "CONFIG_IP_NF_NAT=y"
             ensure_config "CONFIG_IP_NF_TARGET_MASQUERADE=y"
             ensure_config "CONFIG_IP_NF_TARGET_REDIRECT=y"
             ensure_config "CONFIG_IP_NF_MANGLE=y"
-            ensure_config "CONFIG_IP6_NF_IPTABLES=y"
-            ensure_config "CONFIG_IP6_NF_FILTER=y"
-            ensure_config "CONFIG_IP6_NF_MANGLE=y"
-            ensure_config "CONFIG_IP6_NF_NAT=y"
-            ensure_config "CONFIG_IP6_NF_TARGET_MASQUERADE=y"
-
-            # 容器内做端口转发/路由所需
             ensure_config "CONFIG_IP_ADVANCED_ROUTER=y"
             ensure_config "CONFIG_IP_MULTIPLE_TABLES=y"
-            ensure_config "CONFIG_IP_NF_MATCH_ECN=y"
-            ensure_config "CONFIG_IP_NF_MATCH_TTL=y"
 
             # --- runc / seccomp：容器默认 seccomp profile 依赖 ---
             ensure_config "CONFIG_SECCOMP=y"
             ensure_config "CONFIG_SECCOMP_FILTER=y"
 
-            # --- 杂项：lxc-checkconfig 关注项 ---
-            ensure_config "CONFIG_FHANDLE=y"
-            ensure_config "CONFIG_AUDIT=y"
-            ensure_config "CONFIG_EVENTFD=y"
-            ensure_config "CONFIG_EPOLL=y"
-            ensure_config "CONFIG_UNIX_DIAG=y"
-            ensure_config "CONFIG_INET_DIAG=y"
-            ensure_config "CONFIG_PACKET_DIAG=y"
-            ensure_config "CONFIG_NETLINK_DIAG=y"
-            ensure_config "CONFIG_CGROUP_SCHED=y"
+            # ============ 以下为可选增强，按档位/开关决定是否加入 ============
+            # 这些要么改 task_struct 布局（kABI 风险），要么改开机路径上的行为，
+            # 要么只是"更好用"而非"必需"。默认全部不加，
+            # 等 minimal 档确认能正常开机后再逐档打开，避免又一次卡第一屏。
+            EXTRA_LEVEL=0
+            [ "${CONTAINER_LEVEL}" = "standard" ] && EXTRA_LEVEL=1
+            [ "${CONTAINER_LEVEL}" = "full" ] && EXTRA_LEVEL=2
+
+            if [ "${CONTAINER_LEVEL}" = "minimal" ]; then
+              echo "  ℹ️  CONTAINER_LEVEL=minimal：跳过以下高风险/可选配置："
+              echo "      FHANDLE PID_NS 覆盖 macvlan ipvlan IPv6 NAT 族 nf_tables"
+              echo "      XT_TARGET_CHECKSUM diag 族"
+              echo "      （POSIX_MQUEUE / IPC_NS 不受档位影响，始终开启 —— Docker 必需）"
+              echo "      → 先只验证这一版能不能开机；能开机再换 standard/full 逐档加回"
+            fi
+
+            # (1) IPC namespace —— Docker **必需**，且必须走"不碰 task_struct"的路。
+            #
+            #   Kconfig 事实：CONFIG_IPC_NS depends on (SYSVIPC || POSIX_MQUEUE)
+            #   —— 二选一即可满足依赖。
+            #
+            #   这两条路的差别是本机型"卡第一屏"的关键：
+            #     SYSVIPC      会给 struct task_struct 加 sysvsem/sysvshm 两个成员，
+            #                  顶掉其后所有字段偏移量 → 必须配 kABI 槽位补丁，
+            #                  而槽位选错就是无限重启在第一屏。
+            #     POSIX_MQUEUE 在 6.6 上**不给 task_struct 增加任何字段**（已核实），
+            #                  因此不产生 kABI 偏移问题，也不依赖补丁。
+            #
+            #   → 安全模式（container_mode=4）走 POSIX_MQUEUE：拿到 IPC_NS，
+            #     代价是**放弃 SysV IPC**（信号量/共享内存），少数镜像会受影响。
+            #   → 想要完整 SysV IPC 再切 container_mode=1/2/3 并配 risky_container_extras=true。
+            if [ "${CONTAINER_IPC_NS}" = "true" ]; then
+              ensure_config "CONFIG_POSIX_MQUEUE=y"
+              ensure_config "CONFIG_IPC_NS=y"
+              echo "  ✅ IPC_NS 走 POSIX_MQUEUE（不碰 task_struct，无 kABI 风险）"
+            else
+              echo "  ⏭️  按输入跳过 IPC_NS（Docker/containerd/runc 会因缺 IPC namespace 启动失败）"
+            fi
+
+            # (2) 完整 SysV IPC：仅 1/2/3 档 + risky 开关才开。
+            #     ⚠️ 必须与 kABI 补丁同步：只开 SYSVIPC 而不打补丁 = 偏移量必被顶掉 = 卡第一屏。
+            if [ "${CONTAINER_MODE}" != "0" ] && [ "${CONTAINER_MODE}" != "4" ] && [ "${RISKY_CONTAINER_EXTRAS}" = "true" ]; then
+              ensure_config "CONFIG_SYSVIPC=y"
+              echo "  ✅ 开启 SYSVIPC（已由 kABI 补丁把 sysvsem/sysvshm 放入槽位 ${CONTAINER_MODE}）"
+            else
+              echo "  ⏭️  不开 CONFIG_SYSVIPC（保持 task_struct 布局不变；IPC_NS 由 POSIX_MQUEUE 提供）"
+            fi
+
+            # (3) PID namespace：stock defconfig 里被显式关掉（# CONFIG_PID_NS is not set），
+            #     打开它会改变开机时进程创建的命名空间行为，属于中风险。
+            if [ "${RISKY_CONTAINER_EXTRAS}" = "true" ]; then
+              ensure_config "CONFIG_PID_NS=y"
+            else
+              echo "  ⏭️  跳过 CONFIG_PID_NS（容器仍可用 --pid=host 或共享 host pid ns）"
+            fi
+
+            # (4) 额外网络驱动与诊断接口：不影响开机，纯粹"更好用"
+            if [ "${EXTRA_LEVEL}" -ge 1 ]; then
+              ensure_config "CONFIG_MACVLAN=y"
+              ensure_config "CONFIG_IPVLAN=y"
+              ensure_config "CONFIG_NF_TABLES=y"
+              ensure_config "CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y"
+              ensure_config "CONFIG_IP6_NF_IPTABLES=y"
+              ensure_config "CONFIG_IP6_NF_FILTER=y"
+              ensure_config "CONFIG_IP6_NF_MANGLE=y"
+              ensure_config "CONFIG_IP6_NF_NAT=y"
+              ensure_config "CONFIG_IP6_NF_TARGET_MASQUERADE=y"
+              ensure_config "CONFIG_IP_NF_MATCH_ECN=y"
+              ensure_config "CONFIG_IP_NF_MATCH_TTL=y"
+              ensure_config "CONFIG_AUDIT=y"
+              ensure_config "CONFIG_EVENTFD=y"
+              ensure_config "CONFIG_EPOLL=y"
+            fi
+            if [ "${RISKY_CONTAINER_EXTRAS}" = "true" ] || [ "${EXTRA_LEVEL}" -ge 1 ]; then
+              ensure_config "CONFIG_FHANDLE=y"
+              ensure_config "CONFIG_UNIX_DIAG=y"
+              ensure_config "CONFIG_INET_DIAG=y"
+              ensure_config "CONFIG_PACKET_DIAG=y"
+              ensure_config "CONFIG_NETLINK_DIAG=y"
+            fi
+
+            echo "  📋 本档位：mode=${CONTAINER_MODE} level=${CONTAINER_LEVEL} ipc_ns=${CONTAINER_IPC_NS} device_controller=${CGROUP_DEVICE_CONTROLLER} risky_extras=${RISKY_CONTAINER_EXTRAS}"
             echo "# === end container / Docker support ===" >> "$CONFIG"
             report_skipped
           else
@@ -968,10 +1085,10 @@ jobs:
             grep -qE "^$1=y" "$DOTCONFIG" && echo "y" || echo "n"
           }
 
-          # 容器功能真正缺失会导致 dockerd / runc 直接报错，所以这些必须为 y
+          # 只要求「当前档位下我们主动开启过」的项；未开启的档位不强求。
+          # 否则 minimal 档会因为没开 SYSVIPC/PID_NS 而被误判为失败。
           REQUIRED=(
-            CONFIG_NAMESPACES CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_PID_NS
-            CONFIG_NET_NS CONFIG_USER_NS
+            CONFIG_NAMESPACES CONFIG_UTS_NS CONFIG_NET_NS CONFIG_USER_NS
             CONFIG_CGROUPS CONFIG_CGROUP_SCHED CONFIG_CGROUP_PIDS CONFIG_CPUSETS
             CONFIG_MEMCG CONFIG_BLK_CGROUP CONFIG_CGROUP_BPF
             CONFIG_OVERLAY_FS
@@ -982,14 +1099,54 @@ jobs:
             CONFIG_SECCOMP CONFIG_SECCOMP_FILTER
           )
 
+          # 按档位追加"本次应当生效"的项
+          EXTRA_LEVEL=0
+          [ "${CONTAINER_LEVEL}" = "standard" ] && EXTRA_LEVEL=1
+          [ "${CONTAINER_LEVEL}" = "full" ] && EXTRA_LEVEL=2
+
+          # IPC namespace：CONTAINER_IPC_NS=true 时走 POSIX_MQUEUE，两者都必须实际生效
+          if [ "${CONTAINER_IPC_NS}" = "true" ]; then
+            REQUIRED+=(CONFIG_POSIX_MQUEUE CONFIG_IPC_NS)
+          else
+            echo "ℹ️  CONTAINER_IPC_NS=false：IPC_NS 未开启，不作要求（容器需 --ipc=host）"
+          fi
+
+          # SYSVIPC 仅在 kABI 模式（1/2/3）且开 risky 时才要求。
+          # ⚠️ 反向校验同样重要：安全模式/关闭模式下任务必须**没有** SYSVIPC，
+          #    否则说明 config 逻辑写漏了，task_struct 会在没打补丁的情况下被改布局 → 卡第一屏。
+          if [ "${CONTAINER_MODE}" != "0" ] && [ "${CONTAINER_MODE}" != "4" ] && [ "${RISKY_CONTAINER_EXTRAS}" = "true" ]; then
+            REQUIRED+=(CONFIG_SYSVIPC CONFIG_PID_NS)
+          else
+            echo "ℹ️  未开启 SYSVIPC 档位：不作要求"
+            if [ "$(docker_state CONFIG_SYSVIPC)" = "y" ]; then
+              echo "❌ CONFIG_SYSVIPC=y 但本次没有走 kABI 补丁（container_mode=${CONTAINER_MODE}）！"
+              echo "   task_struct 布局已被改动却没有槽位补丁，刷入必然卡第一屏，拒绝继续。"
+              exit 1
+            fi
+            echo "✅ 已确认 CONFIG_SYSVIPC 未开启（task_struct 布局未被改动）"
+          fi
+
+          if [ "${RISKY_CONTAINER_EXTRAS}" = "true" ] || [ "${EXTRA_LEVEL}" -ge 1 ]; then
+            REQUIRED+=(CONFIG_FHANDLE)
+          fi
+          if [ "${EXTRA_LEVEL}" -ge 1 ]; then
+            REQUIRED+=(CONFIG_MACVLAN CONFIG_IPVLAN)
+          fi
+          if [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ]; then
+            REQUIRED+=(CONFIG_CGROUP_DEVICE)
+          fi
+
           # 影响体验但非致命，缺失只告警
           OPTIONAL=(
-            CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_CGROUP_DEVICE
-            CONFIG_BRIDGE_NETFILTER CONFIG_MACVLAN CONFIG_IPVLAN
-            CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE
+            CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_PID_NS
+            CONFIG_CGROUP_DEVICE CONFIG_FHANDLE
+            CONFIG_BRIDGE_NETFILTER CONFIG_DUMMY CONFIG_NETFILTER_ADVANCED
+            CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_NF_TABLES
             CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_TARGET_CHECKSUM
-            CONFIG_FHANDLE CONFIG_UNIX_DIAG CONFIG_PACKET_DIAG CONFIG_NETLINK_DIAG
+            CONFIG_UNIX_DIAG CONFIG_PACKET_DIAG CONFIG_NETLINK_DIAG CONFIG_INET_DIAG
+            CONFIG_MACVLAN CONFIG_IPVLAN
             CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR CONFIG_DEVTMPFS
+            CONFIG_IP_ADVANCED_ROUTER CONFIG_IP_MULTIPLE_TABLES
           )
 
           echo "| 配置项 | 状态 | 说明 |"
@@ -1015,19 +1172,13 @@ jobs:
           grep -n "ANDROID_KABI_USE\|_ANDROID_KABI_REPLACE" \
             kernel_workspace/kernel_platform/common/include/linux/sched.h || true
 
-          if [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ] \
-             && [ "$(docker_state CONFIG_CGROUP_DEVICE)" != "y" ]; then
-            echo "⚠️  CONFIG_CGROUP_DEVICE 未生效：Docker 的设备白名单(devices cgroup)将不可用，"
-            echo "    需要用 --privileged 或自定义 device cgroup 规则绕过。"
-          fi
-
           if [ "${#FAILED[@]}" -gt 0 ]; then
             echo "❌ 以下容器必需内核配置未生效：${FAILED[*]}"
             echo "   常见原因：前置依赖未开启，或该符号在本内核树中不存在。"
             exit 1
           fi
 
-          echo "✅ 容器 / Docker 必需内核配置全部就绪"
+          echo "✅ 本档位（level=${CONTAINER_LEVEL} device_ctrl=${CGROUP_DEVICE_CONTROLLER} risky=${RISKY_CONTAINER_EXTRAS}）必需项全部就绪"
 
       - name: Commit modifications to clean tree
         run: |
@@ -1103,8 +1254,18 @@ jobs:
             CONTAINER_ZIP_PART="noDocker"
             CONTAINER_LABEL="关闭"
           else
-            CONTAINER_ZIP_PART="Docker-kABI${CONTAINER_MODE}"
-            CONTAINER_LABEL="Docker/LXC（kABI 槽位 ${CONTAINER_MODE}）"
+            # 把档位与两个风险开关编进文件名/标签：
+            # 二分排查时要一眼看出手上这个 zip 到底是哪一档，否则很容易刷错包。
+            CONTAINER_ZIP_PART="Docker-${CONTAINER_LEVEL}"
+            [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ] && CONTAINER_ZIP_PART="${CONTAINER_ZIP_PART}-devctl"
+            # 安全模式（4）单独标出来：这是"不碰 task_struct"的版本，最容易开机
+            if [ "${CONTAINER_MODE}" = "4" ]; then
+              CONTAINER_ZIP_PART="${CONTAINER_ZIP_PART}-safe"
+            elif [ "${RISKY_CONTAINER_EXTRAS}" = "true" ]; then
+              CONTAINER_ZIP_PART="${CONTAINER_ZIP_PART}-kABI${CONTAINER_MODE}"
+            fi
+            [ "${CONTAINER_IPC_NS}" = "true" ] && CONTAINER_ZIP_PART="${CONTAINER_ZIP_PART}-ipcns"
+            CONTAINER_LABEL="Docker/LXC（${CONTAINER_LEVEL} · devices=${CGROUP_DEVICE_CONTROLLER} · risky=${RISKY_CONTAINER_EXTRAS}）"
           fi
 
           {
@@ -1135,11 +1296,31 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Prepare release metadata (不按 tag 标识产物)
+        run: |
+          set -euo pipefail
+
+          # 产物标识不再使用 tag / 版本号，统一以 ZIP_NAME 为准。
+          # Release 只是"最近一次 pre 构建"的投放位：
+          #   tag  → p<run_number>.<run_attempt>，仅保证唯一性，不含版本语义
+          #   name → [pre] 日期 — 机型 — 容器档位（一眼看出是哪一档）
+          # 旧写法 tag_name: "${KSUVER}" 会让同一个 KSUVER 的第二次构建
+          # 直接失败在 "tag already exists"。
+          {
+            echo "RELEASE_TAG=p${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+            echo "RELEASE_NAME=[pre] ${DATE} — ${DEVICE_NAME} — SUSFS ${SUSVER} — ${CONTAINER_ZIP_PART}"
+          } >> "$GITHUB_ENV"
+
+          echo "🏷️  Release tag : p${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}（仅唯一性，非产物标识）"
+          echo "📛  Release name: [pre] ${DATE} — ${DEVICE_NAME} — SUSFS ${SUSVER} — ${CONTAINER_ZIP_PART}"
+          echo "📦  产物标识    : ${ZIP_NAME}"
+
       - name: Create Release
         if: "${{ github.event_name == 'schedule' || inputs.create_release == true }}"
         uses: softprops/action-gh-release@v3
         with:
-          name: Release ${{ env.DATE }} — ReSukiSU ${{ env.KSUVER }} — SUSFS ${{ env.SUSVER }} — ${{ env.CONTAINER_ZIP_PART }}
+          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.RELEASE_TAG }}
           body: |
             ## 📦 ${{ env.DEVICE_NAME }} ReSukiSU 内核
 
@@ -1152,25 +1333,91 @@ jobs:
             | SUSFS | ${{ env.SUSVER }} — `${{ env.SUSFS_BRANCH_NAME }}` |
             | 内核后缀 | `${{ env.KERNEL_SUFFIX }}` |
             | 容器支持 | ${{ env.CONTAINER_LABEL }} |
+            | 容器档位 | `container_mode=${{ env.CONTAINER_MODE }}` / `container_level=${{ env.CONTAINER_LEVEL }}` / `ipc_ns=${{ env.CONTAINER_IPC_NS }}` / `device_controller=${{ env.CGROUP_DEVICE_CONTROLLER }}` / `risky_extras=${{ env.RISKY_CONTAINER_EXTRAS }}` |
             | KPM | ❌ 已移除（ReSukiSU 上游不再支持） |
             | ZIP SHA256 | `${{ env.ZIP_SHA256 }}` |
 
-            ### 🐳 容器 / Docker 支持说明
+            ### 🐳 容器 / Docker 支持（分档位，便于二分定位）
 
-            - 已加入 `CONFIG_IPC_NS` / `CONFIG_PID_NS` / `CONFIG_USER_NS` / `CONFIG_NET_NS`、
-              cgroup（含 `CGROUP_DEVICE`）、`OVERLAY_FS`、`VETH`/`BRIDGE`、
-              NAT/MASQUERADE、`SECCOMP_FILTER` 等 Docker 必需项。
-            - **kABI 说明**：开启 `CONFIG_SYSVIPC` 原本会改变 `struct task_struct` 中
-              `sysvsem`/`sysvshm` 的位置，从而顶掉后续字段偏移量、导致厂商预编译模块
-              加载失败而**卡开机**。本内核通过 kABI 补丁把这两个成员放进
-              `ANDROID_KABI_RESERVE` 预留槽位（本次使用槽位 `${{ env.CONTAINER_MODE }}` 组合），
-              字段偏移量保持不变。
-            - ⚠️ 若刷入后**无法开机 / 卡第一屏**：请把 `container_mode` 换成另一个编号
-              （`1` → `2` → `3`）重新构建。不同系统版本占用的槽位不同，只有一个组合可用。
-            - 设备端验证：`sudo ./check-config.sh`（moby）应无 `missing`，随后
-              `pkg install root-repo && pkg install docker tini` 即可原生运行容器。
-          tag_name: ${{ env.KSUVER }}
-          prerelease: false
+            本内核把容器相关内核配置按**风险**分档，默认只开公认安全的那批，
+            目的是避免"一次全开 → 卡第一屏 → 完全不知道是哪一项"。
+
+            | 档位 | 内容 |
+            |------|------|
+            | `minimal`（默认） | namespace 基础、cgroup 基础、`OVERLAY_FS`、`VETH`/`BRIDGE`/`DUMMY`、IPv4 NAT/MASQUERADE、`SECCOMP_FILTER` |
+            | `standard` | + `POSIX_MQUEUE`/`IPC_NS`、macvlan/ipvlan、IPv6 NAT 族、nf_tables、XT_CHECKSUM、AUDIT/EVENTFD/EPOLL、FHANDLE、diag 族 |
+            | `full` | 预留：再叠加显式开关 |
+
+            两个独立开关（默认 **关**）控制高风险项：
+
+            - `cgroup_device_controller` → `CONFIG_CGROUP_DEVICE`（cgroup v1 devices 控制器）
+            - `risky_container_extras` → `CONFIG_SYSVIPC`（含 kABI 槽位补丁）、`CONFIG_PID_NS`、
+              `FHANDLE`、diag 族
+
+            #### 🛡️ `container_mode=4` 安全模式（默认，推荐先用这个）
+
+            **完全不碰 `struct task_struct`**，从根上排除"卡第一屏"的头号原因：
+
+            | | 安全模式 `4` | kABI 模式 `1/2/3` |
+            |---|---|---|
+            | `CONFIG_SYSVIPC` | ❌ 关闭（不改 `task_struct` 布局） | ✅ 开启 |
+            | `task_struct` 补丁 | ❌ 不需要 | ✅ 改到 kABI padding 槽位 |
+            | `CONFIG_POSIX_MQUEUE` | ✅ 开启 | ✅ 开启 |
+            | `CONFIG_IPC_NS` | ✅ **仍然开启** | ✅ 开启 |
+            | SysV IPC（信号量/共享内存） | ❌ 不可用 | ✅ 可用 |
+            | 卡第一屏风险 | 低 | 取决于槽位是否选对 |
+
+            原理：`CONFIG_IPC_NS` 的 Kconfig 依赖是 `(SYSVIPC || POSIX_MQUEUE)`，**二选一即可**；
+            而 `POSIX_MQUEUE` 在 6.6 上不给 `task_struct` 增加任何字段，因此不产生 kABI 偏移问题。
+            代价只有"放弃 SysV IPC"——`dockerd`/`containerd`/`runc` 本身不受影响，
+            少数依赖 SysV 信号量/共享内存的镜像才需要切到 `1/2/3`。
+
+            > ⚠️ **`CONFIG_CGROUP_DEVICE` 在 OnePlus/OPPO 上是有据可查的"卡开机"元凶**，
+            > 且 AOSP GKI 刻意不默认启用它，因此这里默认关闭。缺它只影响 Docker 的
+            > 设备白名单，可用 `--privileged` 或自定义 device cgroup 规则绕过。
+
+            ### 🔧 若刷入后卡第一屏 —— 请按这个顺序排查
+
+            1. **先回滚**：刷回你上个能开机的内核（`boot` 分区），确认设备可用再继续。
+               ⚠️ 不要让设备一直停在反复重启状态，有触发 A/B 回滚或 data 损坏的风险。
+            2. 重新构建，用**默认组合**：`container_mode=4` + `container_ipc_ns=true`，
+               并确保 `cgroup_device_controller=false`、`risky_container_extras=false`。
+               这一版完全不改 `task_struct`，是最有希望开机的组合。
+            3. 若第 2 步**能**开机 → 说明就是 kABI 槽位问题。想要完整 SysV IPC 时，
+               再切 `container_mode=2`（槽位 6+7;8）或 `3`（槽位 3+4;5）
+               并打开 `risky_container_extras=true`，**每次只改这一个变量**。
+            4. 若第 2 步**也**卡第一屏 → 说明问题不在 kABI，按下面两档继续二分：
+               - 先试 `cgroup_device_controller=true` 之外的组合，即把它保持在 `false`
+                 的同时把 `container_level` 降到 `minimal`（默认已是）；
+               - 再构建 `container_mode=0`（完全不加容器配置）作为基线对照。
+                 如果 `container_mode=0` 也卡第一屏 → 与容器改动无关，
+                 问题在 ReSukiSU/SUSFS/zram/sched_ext 或内核本身。
+            5. 若 `container_mode=0` 能开机，而安全模式 `4` 不能 → 逐项关闭安全模式里的
+               基础项继续二分，优先怀疑 `CONFIG_USER_NS`、`OVERLAY_FS`、`NETFILTER_ADVANCED`。
+
+            ### 🔎 抓取"到底卡在哪"的证据（比反复试错快得多）
+
+            如果你能进 bootloader/recents 或 recovery，请尽量抓下面任一信息，
+            这比继续盲试有用得多：
+
+            - **内核是否 panic**：接 USB 后 `adb shell dmesg` 或 recovery 下
+              `cat /proc/last_kmsg` / `dmesg`；看到 `Kernel panic` / `Unable to handle
+              kernel NULL pointer` 就是内核崩溃，否则多半是 userspace/模块加载卡住。
+            - **厂商模块是否加载失败**：
+              `adb shell dmesg | grep -iE "module|vermagic|disagrees|unknown symbol"`
+              —— 出现 `disagrees about version of symbol` 或 `unknown symbol`
+              就说明是 kABI/符号 CRC 问题，应关掉 `risky_container_extras`。
+            - **cgroup 控制器是否被 init 拒绝**：
+              `adb shell dmesg | grep -iE "cgroup|devices.allow|init:"`
+
+            设备端最终验证：`sudo ./check-config.sh`（moby）应无 `missing`，随后
+            `pkg install root-repo && pkg install docker tini` 即可原生运行容器。
+          # tag 不再承担"产物标识"职责：只用 p<run_number>.<run_attempt> 保证唯一，
+          # 不带 KSUVER / 内核版本等语义（见上面 "Prepare release metadata" 步骤）。
+          # prerelease=true + make_latest=false：这些内核仍在验证阶段，
+          # 容器相关档位刷入有卡第一屏风险，绝不当作稳定版。
+          prerelease: true
+          make_latest: false
           files: ${{ env.ZIP_NAME }}
           fail_on_unmatched_files: true
         env:
@@ -1193,7 +1440,7 @@ jobs:
             echo "| ReSukiSU | \`${{ env.KSUVER }}\` (\`${{ env.KSU_COMMIT_SHA }}\`) |"
             echo "| SUSFS | \`${{ env.SUSVER }}\` / \`${{ env.SUSFS_BRANCH_NAME }}\` |"
             echo "| 容器支持 | ${{ env.CONTAINER_LABEL }} |"
-            echo "| cgroup devices | \`${{ env.CGROUP_DEVICE_CONTROLLER }}\` |"
+            echo "| 容器档位 | \`mode=${{ env.CONTAINER_MODE }}\` / \`level=${{ env.CONTAINER_LEVEL }}\` / \`ipc_ns=${{ env.CONTAINER_IPC_NS }}\` / \`devices=${{ env.CGROUP_DEVICE_CONTROLLER }}\` / \`risky=${{ env.RISKY_CONTAINER_EXTRAS }}\` |"
             echo "| KPM | ❌ 已移除 |"
             echo "| ZIP | \`${{ env.ZIP_NAME }}\` |"
             echo "| Image SHA256 | \`${{ env.IMAGE_SHA256 }}\` |"
