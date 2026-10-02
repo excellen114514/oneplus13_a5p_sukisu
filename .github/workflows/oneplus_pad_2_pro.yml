@@ -24,6 +24,21 @@ on:
         required: true
         default: true
         type: boolean
+      container_mode:
+        description: "🐳 容器/Docker 支持: 0=关闭 | 1=kABI padding 槽位 1/2/3 | 2=槽位 6/7/8 | 3=槽位 3/4/5"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "0"
+      cgroup_device_controller:
+        description: "🧩 开启 cgroup v1 devices 控制器（Docker 必需；若卡开机/无法启动请改为 false 重新构建）"
+        required: true
+        default: true
+        type: boolean
       create_release:
         description: "📤 发布 GitHub Release"
         required: true
@@ -55,6 +70,11 @@ jobs:
       KSU_SETUP_BRANCH: ${{ inputs.ksu_setup_branch || 'main' }}
       KSU_META: ${{ inputs.ksu_meta || 'main/⚡Ultra⚡/' }}
       SUSFS_META: ${{ inputs.susfs_meta }}
+      # 容器/Docker 支持。container_mode: 0=关闭; 1/2/3 = 使用不同的 task_struct
+      # kABI padding 槽位组合。同一机型不同系统版本，厂商预编译模块占用的槽位不同，
+      # 若刷入后卡开机/黑屏，请换下一个编号重新构建（1 -> 2 -> 3）。
+      CONTAINER_MODE: ${{ inputs.container_mode || '1' }}
+      CGROUP_DEVICE_CONTROLLER: ${{ inputs.cgroup_device_controller == false && 'false' || 'true' }}
       DEVICE_ID: "pad2pro"
       DEVICE_NAME: "OnePlus Pad 2 Pro"
       DEVICE_NAME_SAFE: "OnePlusPad2Pro"
@@ -167,6 +187,297 @@ jobs:
           } >> "$GITHUB_ENV"
 
           echo "✅ ReSukiSU ${KSU_BRANCH} @ ${KSU_COMMIT_SHA} -> ${KSU_VERSION}"
+
+      - name: Container support — kABI-safe SYSVIPC patch
+        if: ${{ env.CONTAINER_MODE != '0' }}
+        run: |
+          set -euo pipefail
+
+          COMMON=kernel_workspace/kernel_platform/common
+          SCHED="$COMMON/include/linux/sched.h"
+          [ -f "$SCHED" ] || { echo "❌ 找不到 $SCHED"; exit 1; }
+
+          # 为什么必须打这个补丁：
+          #   Docker/LXC 要求 CONFIG_IPC_NS=y，而 IPC_NS 依赖 SYSVIPC 或 POSIX_MQUEUE。
+          #   直接开 CONFIG_SYSVIPC 会让 task_struct 新增 sysvsem/sysvshm 两个成员，
+          #   把其后所有字段的偏移量顶掉 → 与厂商预编译模块(kgsl/相机/显示等)的 kABI
+          #   不再匹配 → 模块加载失败 / 内核崩溃 → 卡开机。
+          #   本补丁把这两个成员搬进 struct task_struct 末尾 Android 预留的 kABI
+          #   padding 槽位，字段偏移量保持不变，因此可以安全开启。
+          #   思路与 Droidspaces 项目 (ravindu644/Droidspaces-OSS) 的 GKI kABI 修补一致，
+          #   这里内联实现，不依赖外部补丁文件能否按上下文应用成功。
+          case "${CONTAINER_MODE}" in
+            1) KABI_SLOTS=(1 2 3) ;;
+            2) KABI_SLOTS=(6 7 8) ;;
+            3) KABI_SLOTS=(3 4 5) ;;
+            *) echo "❌ 未知 CONTAINER_MODE=${CONTAINER_MODE}（应为 0/1/2/3）"; exit 1 ;;
+          esac
+
+          python3 - "$SCHED" "${KABI_SLOTS[0]}" "${KABI_SLOTS[1]}" "${KABI_SLOTS[2]}" <<'PY'
+          import re
+          import sys
+
+          path, s1, s2, s3 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          raw = open(path, encoding="utf-8", newline="").read()
+
+          # 统一成 LF 再改写：kernel 源码理论上是 LF，但本地/CI 缓存都可能带上 CRLF，
+          # 而写死 "\n" 的正则遇到 CRLF 会整体静默失配（这次就是栽在这里）。
+          had_crlf = "\r\n" in raw
+          text = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+          # 幂等：若该树已经处理过（成员已在 kABI 槽位里）就直接跳过
+          if "ANDROID_KABI_USE" in text and re.search(r"ANDROID_KABI_USE\(\s*\d+\s*,\s*struct sysv_sem sysvsem\s*\)", text):
+              print("ALREADY")
+              raise SystemExit(0)
+
+          # 1. 去掉 task_struct 中部原本的 SYSVIPC 成员（它们才是偏移量破坏者）
+          #    采用「逐行判定」而不是跨行正则：sysvsem/sysvshm 之间夹注释、缩进或
+          #    对齐方式变化都不会失配（跨行正则已连续踩坑，这里彻底换掉）。
+          #    本步骤逻辑与 githubworkflow/test_container_kabi_patch.py 保持一致，
+          #    后者可离线运行验证是否仍能命中。
+          member_re = re.compile(r"^\s*struct\s+sysv_(?:sem|shm)\s+sysv(?:sem|shm)\s*;")
+          ifdef_re = re.compile(r"^\s*#\s*ifdef\s+CONFIG_SYSVIPC\b")
+          endif_re = re.compile(r"^\s*#\s*endif\b")
+
+          lines = text.split("\n")
+          hits = [i for i, ln in enumerate(lines) if member_re.match(ln)]
+          if len(hits) != 2:
+              print(f"ERROR:匹配到 {len(hits)} 条 sysv 成员声明，期望 2 条")
+              for i, ln in enumerate(lines):
+                  if "sysv_" in ln:
+                      print(f"  {i + 1:5d}| {ln!r}")
+              raise SystemExit(1)
+          first, second = hits
+
+          replacement = (
+              "/*\n"
+              "\t * CONFIG_SYSVIPC 的两个成员已改放到本结构末尾的 Android kABI\n"
+              "\t * padding 槽位（见下方 ANDROID_KABI_USE），以免改变后续字段偏移量。\n"
+              "\t */"
+          )
+
+          open_idx = None
+          for i in range(first - 1, max(first - 6, -1), -1):
+              if ifdef_re.match(lines[i]):
+                  open_idx = i
+                  break
+
+          close_idx = None
+          if open_idx is not None:
+              for j in range(second + 1, len(lines)):
+                  if endif_re.match(lines[j]):
+                      close_idx = j
+                      break
+
+          if open_idx is not None and close_idx is not None and close_idx > second:
+              print(f"DEBUG:与 #ifdef 整块一起替换（{close_idx - open_idx + 1} 行）")
+              lines = lines[:open_idx] + [replacement] + lines[close_idx + 1:]
+          else:
+              print("DEBUG:未包裹在 #ifdef 中，仅移除两行成员声明")
+              keep, inserted = [], False
+              for i, ln in enumerate(lines):
+                  if i in (first, second):
+                      if not inserted:
+                          keep.append(replacement)
+                          inserted = True
+                      continue
+                  keep.append(ln)
+              lines = keep
+
+          text = "\n".join(lines)
+
+          # 2. 校验槽位都在 struct task_struct 内
+          #    注意 end 必须换算成绝对下标：切片查找返回的是相对 m.end() 的偏移，
+          #    直接和绝对下标比较会让所有槽位都被误判为「不在范围内」。
+          sm = re.search(r"(?m)^struct task_struct \{[^\n]*\n", text)
+          if not sm:
+              print("ERROR:未在 sched.h 中定位到 struct task_struct 定义")
+              raise SystemExit(1)
+          tail = re.search(r"\n\};", text[sm.end():])
+          if not tail:
+              print("ERROR:未定位到 struct task_struct 定义结尾")
+              raise SystemExit(1)
+          start, end = sm.end(), sm.end() + tail.start()
+
+          # 关键：槽位号 1-4 在 sched_entity / sched_rt_entity / task_struct 里都出现，
+          # 而 sched_entity 排在 task_struct 之前。
+          # 因此绝不能「校验时限定范围、替换时却 subn(count=1)」——那会打中 sched_entity，
+          # 把槽位号替换成那边的缩进。这里直接按位置在 task_struct 区域内替换。
+          slot_pat = re.compile(r"(?m)^([ \t]*)ANDROID_KABI_RESERVE\((\d+)\);[ \t]*$")
+          targets = []
+          for s in (s1, s2, s3):
+              found = [m for m in slot_pat.finditer(text)
+                       if start <= m.start() < end and m.group(2) == s]
+              if len(found) != 1:
+                  print(f"ERROR:槽位 {s} 在 struct task_struct 内匹配到 {len(found)} 处，期望 1 处")
+                  raise SystemExit(1)
+              targets.append(found[0])
+
+          # 3. 把原本“未使用”的保留槽位改写成承载 sysvsem / sysvshm
+          #    用 % 拼接而非 f-string：f-string 表达式里不能出现反斜杠（\t 会语法错误）
+          use_tpl = "ANDROID_KABI_USE(%s, struct sysv_sem sysvsem);"
+          repl_tpl = ("_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(%s), "
+                      "struct sysv_shm sysvshm);")
+          new_frag = {0: use_tpl % s1, 1: repl_tpl % s2, 2: ""}
+
+          # 从后往前替换，避免前面的改动导致后面的下标位移
+          for idx in sorted(range(3), key=lambda i: targets[i].start(), reverse=True):
+              m = targets[idx]
+              text = text[: m.start()] + m.group(1) + new_frag[idx] + text[m.end():]
+
+          # 成员声明必须已从中部彻底消失（逐行复查，不依赖具体缩进）
+          if any(member_re.match(ln) for ln in text.split("\n")):
+              print("ERROR:中部仍残留 sysv 成员声明")
+              raise SystemExit(1)
+
+          for frag in (use_tpl % s1, repl_tpl % s2):
+              if text.count(frag) != 1:
+                  print(f"ERROR:改写后 {frag!r} 出现 {text.count(frag)} 次，期望 1 次")
+                  raise SystemExit(1)
+
+          # 按原文件的换行风格写回：kernel 用 LF，但若检出带 CRLF 也不能给它混进 LF
+          if had_crlf:
+              text = text.replace("\n", "\r\n")
+          with open(path, "w", encoding="utf-8", newline="") as fh:
+              fh.write(text)
+          print(f"PATCHED (eol={'CRLF' if had_crlf else 'LF'})")
+          PY
+
+          echo "🔎 sched.h diff:"
+          git -C "$COMMON" diff --stat -- include/linux/sched.h || true
+          git -C "$COMMON" diff -- include/linux/sched.h | sed -n '1,80p' || true
+
+          # 到此 python 退出码为 0，说明补丁已成功应用或本就已处理过
+          echo "✅ SYSVIPC 已置于 kABI padding 槽位 ${KABI_SLOTS[*]}（或该树已自带处理）"
+
+      - name: Container support — LXC/cgroup + xt_qtaguid compatibility patches
+        if: ${{ env.CONTAINER_MODE != '0' }}
+        run: |
+          set -euo pipefail
+
+          COMMON=kernel_workspace/kernel_platform/common
+
+          # (A) LXC 兼容：为 cgroup v1 的子系统文件额外建立 "<ss>.<file>" 软链。
+          #     Android 以 noprefix 方式挂载 cgroup v1，systemd/LXC 会按 "memory.limit_in_bytes"
+          #     这类前缀名查找文件，缺链接就会判定 cgroup 不可用。
+          #     非 Docker 必需项，因此这里做「尽力而为」注入：失败只告警，不阻断构建。
+          CGROUP_C="$COMMON/kernel/cgroup/cgroup.c"
+          if [ -f "$CGROUP_C" ]; then
+            python3 - "$CGROUP_C" <<'PY' || echo "⚠️ cgroup 前缀兼容补丁未应用（不影响内核编译）"
+          import sys
+
+          path = sys.argv[1]
+          raw = open(path, encoding="utf-8", newline="").read()
+          had_crlf = "\r\n" in raw
+          text = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+          marker = "/* OnePlusPad2Pro: cgroup v1 noprefix 兼容软链 */"
+          if marker in text:
+              print("cgroup 前缀兼容补丁已存在")
+              raise SystemExit(0)
+
+          # 必须精确落在 cgroup_add_file() 内：cgroup_rm_file() 里也有同样的
+          # spin_lock_irq(&cgroup_file_kn_lock) 代码块，只按块匹配会打错位置。
+          # 该函数签名是 GKI 6.6 的形式（无 kn 参数）；老内核是 5 参数版本。
+          fn = re.search(
+              r"static int cgroup_add_file\([^)]*\)\n\{\n",
+              text,
+          )
+          if not fn:
+              print("未找到 cgroup_add_file()（函数签名与预期不符）")
+              raise SystemExit(1)
+          fn_end = text.find("\n}\n", fn.end())
+          if fn_end < 0:
+              print("未定位到 cgroup_add_file() 函数结尾")
+              raise SystemExit(1)
+
+          lock_block = re.compile(
+              r"(?P<i>[ \t]*)spin_lock_irq\(&cgroup_file_kn_lock\);\n"
+              r"[ \t]*cfile->kn = kn;\n"
+              r"[ \t]*spin_unlock_irq\(&cgroup_file_kn_lock\);\n"
+          )
+          hit = lock_block.search(text, fn.end(), fn_end)
+          if not hit:
+              print("未在 cgroup_add_file() 内找到 cfile->kn = kn 注入锚点")
+              raise SystemExit(1)
+
+          indent = hit.group("i")
+          injection = (
+              f"{indent}{marker}\n"
+              f"{indent}if (cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX) &&\n"
+              f"{indent}    !(cft->flags & CFTYPE_NO_PREFIX)) {{\n"
+              f"{indent}\tsnprintf(name, CGROUP_FILE_NAME_MAX, \"%s.%s\",\n"
+              f"{indent}\t\t cft->ss->name, cft->name);\n"
+              f"{indent}\tkernfs_create_link(cgrp->kn, name, kn);\n"
+              f"{indent}}}\n"
+          )
+          text = text[: hit.end()] + injection + text[hit.end():]
+          if had_crlf:
+              text = text.replace("\n", "\r\n")
+          with open(path, "w", encoding="utf-8", newline="") as fh:
+              fh.write(text)
+          print("已注入 cgroup v1 noprefix 前缀软链")
+          PY
+            grep -q "cgroup v1 noprefix 兼容软链" "$CGROUP_C" || echo "⚠️ 未注入 cgroup 前缀兼容软链"
+          else
+            echo "⚠️ 未找到 $CGROUP_C，跳过"
+          fi
+
+          # (B) xt_qtaguid 空指针修复：老内核上跑容器会因 dev_get_stats 触发空指针而重启。
+          #     6.6 GKI 已移除该驱动（Android 10 起弃用），因此仅在文件存在时尽力修复，
+          #     失败只告警，避免为一个本就不存在的文件阻断构建。
+          QTAGUID="$COMMON/net/netfilter/xt_qtaguid.c"
+          if [ ! -f "$QTAGUID" ]; then
+            echo "ℹ️ 未找到 xt_qtaguid.c（6.6 已移除该驱动），无需处理"
+          else
+            python3 - "$QTAGUID" <<'PY' || echo "⚠️ xt_qtaguid 补丁未应用（不影响内核编译）"
+          import re
+          import sys
+
+          path = sys.argv[1]
+          raw = open(path, encoding="utf-8", newline="").read()
+          had_crlf = "\r\n" in raw
+          text = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+          # 成员声明：去掉 dev_stats 局部变量
+          text, n1 = re.subn(
+              r"(?m)^([ \t]*)struct rtnl_link_stats64 dev_stats, \*stats;[ \t]*$",
+              r"\1struct rtnl_link_stats64 *stats;",
+              text,
+              count=1,
+          )
+
+          # 分支：不再调用 dev_get_stats()，直接用 no_dev_stats
+          text, n2 = re.subn(
+              r"(?m)^([ \t]*)if \(iface_entry->active\) \{[ \t]*\n"
+              r"[ \t]*stats = dev_get_stats\(iface_entry->net_dev,[ \t]*\n?[ \t]*&dev_stats\);[ \t]*\n"
+              r"[ \t]*\} else \{[ \t]*\n"
+              r"[ \t]*stats = &no_dev_stats;[ \t]*\n"
+              r"[ \t]*\}[ \t]*\n",
+              r"\1stats = &no_dev_stats;\n",
+              text,
+              count=1,
+          )
+
+          if n1 != 1 or n2 != 1:
+              print(f"未能完成 xt_qtaguid 修复（声明 {n1} 处 / 分支 {n2} 处）")
+              raise SystemExit(1)
+
+          if had_crlf:
+              text = text.replace("\n", "\r\n")
+          with open(path, "w", encoding="utf-8", newline="") as fh:
+              fh.write(text)
+          print("xt_qtaguid 空指针修复已应用")
+          PY
+            echo "ℹ️ xt_qtaguid 处理结束"
+          fi
+
+          # 记录 kABI 槽位使用全貌，便于换用其它 CONTAINER_MODE 时排查
+          echo "---- 内核树内所有 ANDROID_KABI_USE/_ANDROID_KABI_REPLACE 引用 ----"
+          grep -rn "ANDROID_KABI_USE\|_ANDROID_KABI_REPLACE" "$COMMON" \
+            --include=*.c --include=*.h 2>/dev/null | head -n 40 || true
+          echo "---- sched.h 中 kABI 槽位数量 ----"
+          grep -c "ANDROID_KABI_RESERVE(" "$COMMON/include/linux/sched.h" || true
 
       - name: Apply SUSFS patches
         run: |
@@ -376,6 +687,42 @@ jobs:
             grep -qE "^${key}=" "$CONFIG" 2>/dev/null || echo "$entry" >> "$CONFIG"
           }
 
+          # 覆盖已有配置，包括 "# CONFIG_X is not set" 这种被显式关闭的形式
+          # （stock gki_defconfig 里 PID_NS / FHANDLE 等就是用这种写法关掉的）
+          force_set() {
+            local symbol="${1%%=*}"
+            sed -i -E "/^(# )?${symbol}[ =]/d" "$CONFIG" 2>/dev/null || true
+            echo "$1" >> "$CONFIG"
+          }
+
+          # 只在源码 Kconfig 里确实定义了该符号时才开启，避免写进无效条目后
+          # 被 olddefconfig 静默丢弃，也避免误判「已开启」。
+          # 先把所有 Kconfig 符号名缓存成一份清单，避免每个选项都全树 grep。
+          KCONFIG_SYMS="$(mktemp)"
+          find ./common -name 'Kconfig*' -type f -print0 2>/dev/null \
+            | xargs -0 grep -hE '^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null \
+            | sed -E 's/.*[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*$/\1/' | sort -u > "$KCONFIG_SYMS" || true
+          echo "  ℹ️  已缓存 $(wc -l < "$KCONFIG_SYMS") 个 Kconfig 符号"
+          SKIPPED_SYMS=()
+
+          ensure_config() {
+            local entry="$1" symbol="${1%%=*}" name="${1%%=*}"
+            name="${symbol#CONFIG_}"
+            if grep -qxF "$name" "$KCONFIG_SYMS"; then
+              force_set "$entry"
+            else
+              SKIPPED_SYMS+=("$symbol")
+            fi
+          }
+
+          report_skipped() {
+            if [ "${#SKIPPED_SYMS[@]}" -gt 0 ]; then
+              echo "  ⚠️  以下符号在本内核 Kconfig 中不存在，已跳过：${SKIPPED_SYMS[*]}"
+            else
+              echo "  ✅ 所有容器相关符号都存在于本内核 Kconfig"
+            fi
+          }
+
           echo "# === ReSukiSU ===" >> "$CONFIG"
           append_config "CONFIG_KSU=y"
           append_config "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y"
@@ -423,6 +770,128 @@ jobs:
           force_config "CONFIG_LOCALVERSION=\"${KERNEL_SUFFIX}\""
           force_config "CONFIG_LOCALVERSION_AUTO=n"
 
+          # ======================= 容器 / Docker 原生运行支持 =======================
+          # 目标：让 moby check-config.sh 的 "Generally Necessary" 全绿，并满足
+          # dockerd/containerd/runc 在 Android 上原生运行所需的一切内核能力。
+          #
+          # 特别说明（为什么这些项缺一不可）：
+          #   * CONFIG_IPC_NS 依赖 SYSVIPC || POSIX_MQUEUE，两者都没开时 IPC namespace
+          #     会直接变成 "required"，容器起不来。task_struct 偏移量问题由上面
+          #     "kABI-safe SYSVIPC patch" 步骤解决。
+          #   * CONFIG_CGROUP_DEVICE 提供 cgroup v1 devices 控制器，Docker 用它做设备白名单。
+          #   * CONFIG_USER_NS 用于 rootless/非特权容器，并消除 "unsafe procfs" 报错。
+          #   * OVERLAY_FS / VETH / BRIDGE / NF_NAT / MASQUERADE 分别对应 overlay2
+          #     存储驱动、docker0 网桥、容器出网 NAT。
+          if [ "${CONTAINER_MODE}" != "0" ]; then
+            echo "# === Container / Docker support (kABI slots ${CONTAINER_MODE}) ===" >> "$CONFIG"
+
+            # --- IPC 机制（IPC_NS 的前置依赖）---
+            ensure_config "CONFIG_SYSVIPC=y"
+            ensure_config "CONFIG_POSIX_MQUEUE=y"
+
+            # --- 命名空间 ---
+            # NAMESPACES / UTS_NS / NET_NS 在 stock defconfig 里已开启，这里只做兜底
+            ensure_config "CONFIG_NAMESPACES=y"
+            ensure_config "CONFIG_UTS_NS=y"
+            ensure_config "CONFIG_IPC_NS=y"
+            ensure_config "CONFIG_PID_NS=y"
+            ensure_config "CONFIG_NET_NS=y"
+            ensure_config "CONFIG_USER_NS=y"
+            # Cgroup namespace 在部分 OnePlus 机型上会引发开机异常，默认不动，
+            # 需要时由用户显式打开（见 workflow 末尾说明）
+            echo "  ℹ️  CONFIG_CGROUP_NS 保持 stock 状态（避免卡开机）"
+
+            # --- cgroup 控制器 ---
+            ensure_config "CONFIG_CGROUPS=y"
+            ensure_config "CONFIG_MEMCG=y"
+            ensure_config "CONFIG_CGROUP_SCHED=y"
+            ensure_config "CONFIG_CGROUP_FREEZER=y"
+            ensure_config "CONFIG_CGROUP_PIDS=y"
+            ensure_config "CONFIG_CGROUP_BPF=y"
+            ensure_config "CONFIG_CPUSETS=y"
+            ensure_config "CONFIG_BLK_CGROUP=y"
+            ensure_config "CONFIG_CGROUP_CPUACCT=y"
+            if [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ]; then
+              ensure_config "CONFIG_CGROUP_DEVICE=y"
+            else
+              echo "  ⚠️  按输入要求跳过 CONFIG_CGROUP_DEVICE（Docker 的设备白名单将不可用）"
+            fi
+
+            # --- 存储驱动 overlay2 ---
+            ensure_config "CONFIG_OVERLAY_FS=y"
+            ensure_config "CONFIG_TMPFS=y"
+            ensure_config "CONFIG_TMPFS_XATTR=y"
+            ensure_config "CONFIG_TMPFS_POSIX_ACL=y"
+            ensure_config "CONFIG_DEVTMPFS=y"
+
+            # --- 容器网络：网桥 / veth / macvlan ---
+            ensure_config "CONFIG_VETH=y"
+            ensure_config "CONFIG_BRIDGE=y"
+            ensure_config "CONFIG_BRIDGE_NETFILTER=y"
+            ensure_config "CONFIG_MACVLAN=y"
+            ensure_config "CONFIG_IPVLAN=y"
+            ensure_config "CONFIG_DUMMY=y"
+
+            # --- netfilter / iptables：NAT、端口映射、连接跟踪 ---
+            ensure_config "CONFIG_NETFILTER=y"
+            ensure_config "CONFIG_NETFILTER_ADVANCED=y"
+            ensure_config "CONFIG_NF_CONNTRACK=y"
+            ensure_config "CONFIG_NF_NAT=y"
+            ensure_config "CONFIG_NF_TABLES=y"
+            ensure_config "CONFIG_NETFILTER_XTABLES=y"
+            ensure_config "CONFIG_NETFILTER_XT_MATCH_COMMENT=y"
+            ensure_config "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            ensure_config "CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y"
+            ensure_config "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y"
+            ensure_config "CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y"
+            ensure_config "CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y"
+            ensure_config "CONFIG_NETFILTER_XT_NAT=y"
+
+            # 容器出网 / 端口发布（IPv4 + IPv6）
+            ensure_config "CONFIG_IP_NF_IPTABLES=y"
+            ensure_config "CONFIG_IP_NF_FILTER=y"
+            ensure_config "CONFIG_IP_NF_NAT=y"
+            ensure_config "CONFIG_IP_NF_TARGET_MASQUERADE=y"
+            ensure_config "CONFIG_IP_NF_TARGET_REDIRECT=y"
+            ensure_config "CONFIG_IP_NF_MANGLE=y"
+            ensure_config "CONFIG_IP6_NF_IPTABLES=y"
+            ensure_config "CONFIG_IP6_NF_FILTER=y"
+            ensure_config "CONFIG_IP6_NF_MANGLE=y"
+            ensure_config "CONFIG_IP6_NF_NAT=y"
+            ensure_config "CONFIG_IP6_NF_TARGET_MASQUERADE=y"
+
+            # 容器内做端口转发/路由所需
+            ensure_config "CONFIG_IP_ADVANCED_ROUTER=y"
+            ensure_config "CONFIG_IP_MULTIPLE_TABLES=y"
+            ensure_config "CONFIG_IP_NF_MATCH_ECN=y"
+            ensure_config "CONFIG_IP_NF_MATCH_TTL=y"
+
+            # --- runc / seccomp：容器默认 seccomp profile 依赖 ---
+            ensure_config "CONFIG_SECCOMP=y"
+            ensure_config "CONFIG_SECCOMP_FILTER=y"
+
+            # --- 杂项：lxc-checkconfig 关注项 ---
+            ensure_config "CONFIG_FHANDLE=y"
+            ensure_config "CONFIG_AUDIT=y"
+            ensure_config "CONFIG_EVENTFD=y"
+            ensure_config "CONFIG_EPOLL=y"
+            ensure_config "CONFIG_UNIX_DIAG=y"
+            ensure_config "CONFIG_INET_DIAG=y"
+            ensure_config "CONFIG_PACKET_DIAG=y"
+            ensure_config "CONFIG_NETLINK_DIAG=y"
+            ensure_config "CONFIG_CGROUP_SCHED=y"
+            echo "# === end container / Docker support ===" >> "$CONFIG"
+            report_skipped
+          else
+            echo "⏭️ CONTAINER_MODE=0：不加入容器/Docker 内核配置"
+          fi
+          rm -f "$KCONFIG_SYMS"
+
+          # 防止 setlocalversion 在 git 树 dirty 时追加 '+'，导致内核版本变成 6.6.57-Elaina-ExceSama+
+          if [ -f ./common/scripts/setlocalversion ]; then
+            sed -i 's/echo "+"/:/g; s/echo +/:/g' ./common/scripts/setlocalversion || true
+          fi
+
           # 移除 check_defconfig 避免 defconfig 一致性检查失败
           sed -i 's/check_defconfig//' ./common/build.config.gki || true
 
@@ -445,6 +914,98 @@ jobs:
             echo "❌ CONFIG_KPM=y 不应存在（KPM 支持已移除）"
             exit 1
           fi
+
+      - name: Generate kernel configuration (gki_defconfig)
+        run: |
+          set -euo pipefail
+
+          cd kernel_workspace/kernel_platform
+
+          # 单独生成 .config：这样可以在真正花 1~2 小时编译之前，
+          # 先检查容器/Docker 相关配置有没有被 Kconfig 依赖过滤掉。
+          export PATH="$PWD/prebuilts/clang/host/linux-x86/clang-r510928/bin:$PATH"
+
+          cd common
+          make -j"$(nproc --all)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang \
+            RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc \
+            PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole \
+            LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS_PERF+=-O3 \
+            gki_defconfig
+
+          echo "✅ 已生成 out/.config"
+
+      - name: Verify container / Docker config (hard gate)
+        if: ${{ env.CONTAINER_MODE != '0' }}
+        run: |
+          set -euo pipefail
+
+          DOTCONFIG=kernel_workspace/kernel_platform/common/out/.config
+          [ -f "$DOTCONFIG" ] || { echo "❌ 找不到 $DOTCONFIG"; exit 1; }
+
+          docker_state() {
+            grep -qE "^$1=y" "$DOTCONFIG" && echo "y" || echo "n"
+          }
+
+          # 容器功能真正缺失会导致 dockerd / runc 直接报错，所以这些必须为 y
+          REQUIRED=(
+            CONFIG_NAMESPACES CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_PID_NS
+            CONFIG_NET_NS CONFIG_USER_NS
+            CONFIG_CGROUPS CONFIG_CGROUP_SCHED CONFIG_CGROUP_PIDS CONFIG_CPUSETS
+            CONFIG_MEMCG CONFIG_BLK_CGROUP CONFIG_CGROUP_BPF
+            CONFIG_OVERLAY_FS
+            CONFIG_VETH CONFIG_BRIDGE
+            CONFIG_NETFILTER CONFIG_NF_CONNTRACK CONFIG_NF_NAT
+            CONFIG_IP_NF_IPTABLES CONFIG_IP_NF_NAT
+            CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_NETFILTER_XT_TARGET_MASQUERADE
+            CONFIG_SECCOMP CONFIG_SECCOMP_FILTER
+          )
+
+          # 影响体验但非致命，缺失只告警
+          OPTIONAL=(
+            CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_CGROUP_DEVICE
+            CONFIG_BRIDGE_NETFILTER CONFIG_MACVLAN CONFIG_IPVLAN
+            CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE
+            CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_TARGET_CHECKSUM
+            CONFIG_FHANDLE CONFIG_UNIX_DIAG CONFIG_PACKET_DIAG CONFIG_NETLINK_DIAG
+            CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR CONFIG_DEVTMPFS
+          )
+
+          echo "| 配置项 | 状态 | 说明 |"
+          echo "|--------|------|------|"
+
+          FAILED=()
+          for s in "${REQUIRED[@]}"; do
+            v="$(docker_state "$s")"
+            if [ "$v" = "y" ]; then
+              echo "✅ $s=y"
+            else
+              echo "❌ $s 未生效（必需）"
+              FAILED+=("$s")
+            fi
+          done
+
+          for s in "${OPTIONAL[@]}"; do
+            v="$(docker_state "$s")"
+            [ "$v" = "y" ] && echo "✅ $s=y" || echo "⚠️  $s 未生效（可选）"
+          done
+
+          echo "🔎 kABI padding 槽位占用情况:"
+          grep -n "ANDROID_KABI_USE\|_ANDROID_KABI_REPLACE" \
+            kernel_workspace/kernel_platform/common/include/linux/sched.h || true
+
+          if [ "${CGROUP_DEVICE_CONTROLLER}" = "true" ] \
+             && [ "$(docker_state CONFIG_CGROUP_DEVICE)" != "y" ]; then
+            echo "⚠️  CONFIG_CGROUP_DEVICE 未生效：Docker 的设备白名单(devices cgroup)将不可用，"
+            echo "    需要用 --privileged 或自定义 device cgroup 规则绕过。"
+          fi
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "❌ 以下容器必需内核配置未生效：${FAILED[*]}"
+            echo "   常见原因：前置依赖未开启，或该符号在本内核树中不存在。"
+            exit 1
+          fi
+
+          echo "✅ 容器 / Docker 必需内核配置全部就绪"
 
       - name: Commit modifications to clean tree
         run: |
@@ -473,11 +1034,13 @@ jobs:
           export PATH="/usr/lib/ccache:$PATH"
 
           cd common
+          # .config 已在 "Generate kernel configuration" 步骤生成并校验过，
+          # 这里只跑 all，避免重复执行 defconfig 覆盖掉已校验的配置。
           make -j"$(nproc --all)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang \
             RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc \
             PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole \
             LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS_PERF+=-O3 \
-            gki_defconfig all
+            all
 
           echo "🏷️ 内核版本字符串:"
           cat out/include/config/kernel.release 2>/dev/null || true
@@ -489,36 +1052,16 @@ jobs:
           IMAGE="kernel_workspace/kernel_platform/common/out/arch/arm64/boot/Image"
           [ -f "$IMAGE" ] || { echo "❌ 找不到内核 Image"; exit 1; }
 
-          # 公开仓库不需要凭据；优先用 codeload tarball（不涉及 git 认证），
-          # 失败再回退到普通 git clone（保留环境自带的 credential helper）。
-          # 上一版把 credential.helper 清空反而强制了匿名访问，GitHub 回 401 ->
-          # "could not read Username ... terminal prompts disabled"，故不再覆盖。
-          AK3_URL="https://codeload.github.com/Kernel-SU/AnyKernel3/tar.gz/refs/heads/master"
+          # 使用 Bouteillepleine/AnyKernel3，分支 gki-2.0
+          AK3_REPO="https://github.com/Bouteillepleine/AnyKernel3"
+          AK3_BRANCH="gki-2.0"
 
-          fetch_ak3() {
-            rm -rf ./AnyKernel3
-            mkdir -p ./AnyKernel3
-            if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-                 -o /tmp/ak3.tar.gz "$AK3_URL" \
-               && tar -xzf /tmp/ak3.tar.gz -C ./AnyKernel3 --strip-components=1 \
-               && [ -f ./AnyKernel3/anykernel.sh ]; then
-              return 0
-            fi
-            # 回退：普通 git clone（保留环境自带的 credential helper）
-            rm -rf ./AnyKernel3
-            git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git ./AnyKernel3 \
-              && [ -f ./AnyKernel3/anykernel.sh ]
-          }
+          rm -rf ./AnyKernel3
+          git clone --depth=1 -b "$AK3_BRANCH" "$AK3_REPO" ./AnyKernel3
 
-          ok=0
-          for attempt in 1 2 3; do
-            if fetch_ak3; then ok=1; break; fi
-            echo "⚠️ AnyKernel3 获取失败（第 ${attempt} 次），10s 后重试"
-            sleep 10
-          done
-          [ "$ok" = "1" ] || { echo "❌ AnyKernel3 获取失败"; exit 1; }
+          [ -f ./AnyKernel3/anykernel.sh ] || { echo "❌ AnyKernel3 获取失败：缺少 anykernel.sh"; exit 1; }
 
-          rm -rf ./AnyKernel3/.git ./AnyKernel3/push.sh
+          rm -rf ./AnyKernel3/.git
           cp "$IMAGE" ./AnyKernel3/Image
           ls -la ./AnyKernel3 | head -20
 
@@ -534,7 +1077,20 @@ jobs:
             SUSFS_ZIP_PART="SUSFS-${SUSVER:-unknown}"
           fi
 
-          ZIP_NAME="AK3_ReSukiSU_${KSUVER}_${SUSFS_ZIP_PART}_${DEVICE_NAME_SAFE}_${TKERNEL_VERSION}.zip"
+          if [ "${CONTAINER_MODE}" = "0" ]; then
+            CONTAINER_ZIP_PART="noDocker"
+            CONTAINER_LABEL="关闭"
+          else
+            CONTAINER_ZIP_PART="Docker-kABI${CONTAINER_MODE}"
+            CONTAINER_LABEL="Docker/LXC（kABI 槽位 ${CONTAINER_MODE}）"
+          fi
+
+          {
+            echo "CONTAINER_ZIP_PART=${CONTAINER_ZIP_PART}"
+            echo "CONTAINER_LABEL=${CONTAINER_LABEL}"
+          } >> "$GITHUB_ENV"
+
+          ZIP_NAME="AK3_ReSukiSU_${KSUVER}_${SUSFS_ZIP_PART}_${CONTAINER_ZIP_PART}_${DEVICE_NAME_SAFE}_${TKERNEL_VERSION}.zip"
           echo "📦 打包: $ZIP_NAME"
 
           cd AnyKernel3
@@ -561,7 +1117,7 @@ jobs:
         if: "${{ github.event_name == 'schedule' || inputs.create_release == true }}"
         uses: softprops/action-gh-release@v3
         with:
-          name: Release ${{ env.DATE }} — ReSukiSU ${{ env.KSUVER }} — SUSFS ${{ env.SUSVER }}
+          name: Release ${{ env.DATE }} — ReSukiSU ${{ env.KSUVER }} — SUSFS ${{ env.SUSVER }} — ${{ env.CONTAINER_ZIP_PART }}
           body: |
             ## 📦 ${{ env.DEVICE_NAME }} ReSukiSU 内核
 
@@ -573,8 +1129,24 @@ jobs:
             | ReSukiSU | `${{ env.KSUVER }}` (`${{ env.KSU_COMMIT_SHA }}`) |
             | SUSFS | ${{ env.SUSVER }} — `${{ env.SUSFS_BRANCH_NAME }}` |
             | 内核后缀 | `${{ env.KERNEL_SUFFIX }}` |
+            | 容器支持 | ${{ env.CONTAINER_LABEL }} |
             | KPM | ❌ 已移除（ReSukiSU 上游不再支持） |
             | ZIP SHA256 | `${{ env.ZIP_SHA256 }}` |
+
+            ### 🐳 容器 / Docker 支持说明
+
+            - 已加入 `CONFIG_IPC_NS` / `CONFIG_PID_NS` / `CONFIG_USER_NS` / `CONFIG_NET_NS`、
+              cgroup（含 `CGROUP_DEVICE`）、`OVERLAY_FS`、`VETH`/`BRIDGE`、
+              NAT/MASQUERADE、`SECCOMP_FILTER` 等 Docker 必需项。
+            - **kABI 说明**：开启 `CONFIG_SYSVIPC` 原本会改变 `struct task_struct` 中
+              `sysvsem`/`sysvshm` 的位置，从而顶掉后续字段偏移量、导致厂商预编译模块
+              加载失败而**卡开机**。本内核通过 kABI 补丁把这两个成员放进
+              `ANDROID_KABI_RESERVE` 预留槽位（本次使用槽位 `${{ env.CONTAINER_MODE }}` 组合），
+              字段偏移量保持不变。
+            - ⚠️ 若刷入后**无法开机 / 卡第一屏**：请把 `container_mode` 换成另一个编号
+              （`1` → `2` → `3`）重新构建。不同系统版本占用的槽位不同，只有一个组合可用。
+            - 设备端验证：`sudo ./check-config.sh`（moby）应无 `missing`，随后
+              `pkg install root-repo && pkg install docker tini` 即可原生运行容器。
           tag_name: ${{ env.KSUVER }}
           prerelease: false
           files: ${{ env.ZIP_NAME }}
@@ -598,6 +1170,8 @@ jobs:
             echo "| 源码 | \`OnePlusOSS/kernel_manifest\` @ \`oneplus/sm8750\` |"
             echo "| ReSukiSU | \`${{ env.KSUVER }}\` (\`${{ env.KSU_COMMIT_SHA }}\`) |"
             echo "| SUSFS | \`${{ env.SUSVER }}\` / \`${{ env.SUSFS_BRANCH_NAME }}\` |"
+            echo "| 容器支持 | ${{ env.CONTAINER_LABEL }} |"
+            echo "| cgroup devices | \`${{ env.CGROUP_DEVICE_CONTROLLER }}\` |"
             echo "| KPM | ❌ 已移除 |"
             echo "| ZIP | \`${{ env.ZIP_NAME }}\` |"
             echo "| Image SHA256 | \`${{ env.IMAGE_SHA256 }}\` |"
